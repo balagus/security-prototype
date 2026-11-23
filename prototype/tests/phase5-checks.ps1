@@ -260,32 +260,44 @@ $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('lab-admin:' + 
 try { $r = Invoke-WebRequest -UseBasicParsing -Uri ($GrafanaUrl + '/api/user') -Headers @{ Authorization = ('Basic ' + $b64) } -TimeoutSec 10; $basic = [int]$r.StatusCode } catch { $basic = $(if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { -1 }) }
 Write-Result ($basic -eq 401) 'the local admin cannot sign in over HTTP (basic auth off)' ('HTTP {0}' -f $basic)
 try { $r = Invoke-WebRequest -UseBasicParsing -Uri ($GrafanaUrl + '/login') -MaximumRedirection 0 -TimeoutSec 10 -ErrorAction SilentlyContinue; $lc = [int]$r.StatusCode; $loc = [string]$r.Headers['Location'] } catch { $lc = $(if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { -1 }); $loc = $(if ($_.Exception.Response) { [string]$_.Exception.Response.Headers['Location'] } else { '' }) }
-Write-Result (($lc -eq 302) -and ($loc -match 'login/generic_oauth')) '/login sends the browser straight to Keycloak (no login form)' ('HTTP {0} -> {1}' -f $lc, $loc)
+Write-Result ((($lc -eq 302) -or ($lc -eq 307)) -and ($loc -match 'login/generic_oauth')) '/login sends the browser straight to Keycloak (no login form)' ('HTTP {0} -> {1}' -f $lc, $loc)
 $envDump = (Invoke-Docker @('inspect', '-f', '{{range .Config.Env}}{{println .}}{{end}}', $ids['grafana'])).Out
 $cs = Read-P2Secret 'keycloak_grafana_client_secret'
 Write-Result (($envDump -notmatch [regex]::Escape($adminPw)) -and ($envDump -notmatch [regex]::Escape($cs))) 'the Grafana admin password and Keycloak client secret are not in the container environment (Docker secrets, __FILE)' ''
 
 # Authorization-code flow (PKCE) in a throwaway curl container on "lab", where keycloak.localhost
-# resolves (network alias) and Grafana is grafana:3000. The redirect to the browser-facing
-# http://localhost:3000 callback is rewritten to grafana:3000; the state cookie is the same.
+# is a network alias and Grafana is grafana:3000. The redirect to the browser-facing
+# http://localhost:3000 callback is rewritten to grafana:3000.
+# Cookies are carried by hand (read from Set-Cookie, sent as a Cookie header), not with a curl
+# cookie jar: curl drops the Secure cookies Keycloak sets over plain HTTP (browsers keep them on
+# *.localhost, a secure context), and it does not send jar cookies back to the single-label
+# host "grafana" (both measured).
 $oidc = @'
 set -eu
-J=/tmp/jar; G=http://grafana:3000
-loc=$(curl -s -m 15 -c $J -b $J -o /dev/null -w '%{redirect_url}' "$G/login/generic_oauth")
+G=http://grafana:3000
+# curl resolves every *.localhost name to loopback itself (it never asks Docker's DNS), so
+# keycloak.localhost is sent to the keycloak service explicitly. Grafana (Go) uses Docker DNS.
+curl() { command curl --connect-to keycloak.localhost:8180:keycloak:8180 "$@"; }
+# name=value pairs of every Set-Cookie in a header file, as one Cookie header value.
+cookies() { grep -i '^set-cookie:' "$1" | sed -e 's/^[^:]*: *//' -e 's/;.*//' | tr -d '\r' | grep -v '=$' | paste -sd ';' - | sed 's/;/; /g'; }
+loc=$(curl -s -m 15 -D /tmp/g1 -o /dev/null -w '%{redirect_url}' "$G/login/generic_oauth")
+gc=$(cookies /tmp/g1)
 echo "STEP1=${loc%%\?*}"
-page=$(curl -s -m 15 -c $J -b $J "$loc")
+page=$(curl -s -m 15 -D /tmp/k1 "$loc")
+kc=$(cookies /tmp/k1)
 action=$(printf '%s' "$page" | tr '\n' ' ' | grep -o 'action="[^"]*login-actions/authenticate[^"]*"' | head -1 | sed -e 's/^action="//' -e 's/"$//' -e 's/&amp;/\&/g')
 [ -n "$action" ] || { echo "NO_LOGIN_FORM"; exit 3; }
-cb=$(curl -s -m 15 -c $J -b $J -o /dev/null -w '%{redirect_url}' --data-urlencode "username=$U" --data-urlencode "password=$PW" "$action")
+cb=$(curl -s -m 15 -H "Cookie: $kc" -o /dev/null -w '%{redirect_url}' --data-urlencode "username=$U" --data-urlencode "password=$PW" "$action")
 echo "STEP2=${cb%%\?*}"
 case "$cb" in http://localhost:3000/login/generic_oauth*) ;; *) echo "NO_CALLBACK"; exit 4;; esac
-res=$(curl -s -m 30 -c $J -b $J -o /dev/null -w '%{http_code} %{redirect_url}' "$G${cb#http://localhost:3000}")
+res=$(curl -s -m 30 -H "Cookie: $gc" -D /tmp/g2 -o /dev/null -w '%{http_code} %{redirect_url}' "$G${cb#http://localhost:3000}")
 echo "STEP3=$res"
-echo "USER=$(curl -s -m 10 -b $J $G/api/user)"
-echo "ORGS=$(curl -s -m 10 -b $J $G/api/user/orgs)"
-echo "ACTIONS=$(curl -s -m 10 -b $J $G/api/access-control/user/actions)"
-echo "TEMPO=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -b $J $G/api/datasources/proxy/uid/tempo/api/traces/$T)"
-echo "LOKI=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -b $J $G/api/datasources/proxy/uid/loki/loki/api/v1/labels)"
+sc=$(cookies /tmp/g2)
+echo "USER=$(curl -s -m 10 -H "Cookie: $sc" $G/api/user)"
+echo "ORGS=$(curl -s -m 10 -H "Cookie: $sc" $G/api/user/orgs)"
+echo "ACTIONS=$(curl -s -m 10 -H "Cookie: $sc" $G/api/access-control/user/actions)"
+echo "TEMPO=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H "Cookie: $sc" $G/api/datasources/proxy/uid/tempo/api/traces/$T)"
+echo "LOKI=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H "Cookie: $sc" $G/api/datasources/proxy/uid/loki/loki/api/v1/labels)"
 '@
 function Invoke-GrafanaLogin {
     param([string]$User)
@@ -301,11 +313,11 @@ $kv = $al.KV
 $aliceOk = ([string]$kv['USER'] -match '"login":"alice"') -and ([string]$kv['ORGS'] -match '"role":"Viewer"')
 Write-Result $aliceOk 'alice (app1-devs) signs in through Keycloak and gets the Viewer role' ((@('STEP1', 'STEP2', 'STEP3', 'ORGS') | ForEach-Object { '{0}={1}' -f $_, (Short ([string]$kv[$_]) 160) }) -join "`n")
 Write-Result (([string]$kv['ACTIONS'] -match '"datasources:explore"') -and ($kv['TEMPO'] -eq '200') -and ($kv['LOKI'] -eq '200')) 'alice can use Explore and query Tempo (the dotnet trace from check 1) and Loki through Grafana' ('explore: {0}; tempo HTTP {1}; loki HTTP {2}' -f ([string]$kv['ACTIONS'] -match '"datasources:explore"'), $kv['TEMPO'], $kv['LOKI'])
-Write-Result (-not ([string]$kv['ACTIONS'] -match '"(datasources:write|users:create|org\.users:add|dashboards:create)"')) 'alice cannot change data sources, users or dashboards' ''
+Write-Result (([string]$kv['ACTIONS'] -match '"datasources:query"') -and -not ([string]$kv['ACTIONS'] -match '"(datasources:write|users:create|org\.users:add|dashboards:create)"')) 'alice cannot change data sources, users or dashboards' ''
 $bl = Invoke-GrafanaLogin 'bob'
 $kv = $bl.KV
 $bobIn = ([string]$kv['USER'] -match '"login":"bob"')
-Write-Result ((-not $bobIn) -and ($kv['TEMPO'] -ne '200') -and ($kv['LOKI'] -ne '200')) 'bob (not in app1-devs) authenticates at Keycloak but Grafana refuses him (role_attribute_strict); no data access' ((@('STEP2', 'STEP3', 'USER', 'TEMPO', 'LOKI') | ForEach-Object { '{0}={1}' -f $_, (Short ([string]$kv[$_]) 160) }) -join "`n")
+Write-Result (([string]$kv['STEP2'] -eq 'http://localhost:3000/login/generic_oauth') -and (-not $bobIn) -and ($kv['TEMPO'] -ne '200') -and ($kv['LOKI'] -ne '200')) 'bob (not in app1-devs) authenticates at Keycloak but Grafana refuses him (role_attribute_strict); no data access' ((@('STEP2', 'STEP3', 'USER', 'TEMPO', 'LOKI') | ForEach-Object { '{0}={1}' -f $_, (Short ([string]$kv[$_]) 160) }) -join "`n")
 
 # =============================================================================================
 Write-Host ''

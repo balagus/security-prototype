@@ -1141,12 +1141,15 @@ services:
     tmpfs:
       - /tmp:size=16m,mode=1777
     cap_drop: ["ALL"]
-    mem_limit: 192m
+    # Measured: Grafana 13 stalls at 100% CPU (GC) during its first start with 192m, and uses
+    # about 380 MiB right after start; 512m with a Go soft limit of 350 MiB starts in ~20 s.
+    mem_limit: 512m
     security_opt: ["no-new-privileges:true"]
     environment:
+      GOMEMLIMIT: 350MiB
       GF_SERVER_ROOT_URL: http://localhost:3000/
       GF_LOG_MODE: console
-      GF_LOG_LEVEL: warn
+      GF_LOG_LEVEL: info
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"

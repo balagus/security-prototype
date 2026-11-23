@@ -3,7 +3,7 @@
 Date: 2026-11-17
 Revision 8
 
-**Status:** Phases 0 to 4 were executed in the prototype: sections 4.A, 4.B, 4.C (replica path), 4.E (database audit and shipping) and 5. Test counts against the phase 4 stack: 13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently). The MariaDB binary-log password leak found in phase 4 is fixed and tested (4.E, 5.3). The approval portal, Warpgate and break-glass (phase 5) have **not** been executed. Host access controls (4.D) have **not** been executed. Items still marked "to test" remain unverified.
+**Status:** Phases 0 to 4 were executed in the prototype: sections 4.A, 4.B, 4.C (replica path), 4.E (database audit and shipping) and 5. Test counts against the phase 4 stack: 13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently). The MariaDB binary-log password leak found in phase 4 is fixed and tested (4.E, 5.3). Phase 5 (debug telemetry: traces and logs in Grafana, redacted, separate from the audit store) was executed on 2026-11-23: 27 phase 5 checks and 13 smoke checks pass; the phase 4 suite on the phase 5 stack passes 94 of 96 (two app-request checks hit dropped host connections, 7.5). The approval portal, Warpgate and break-glass (now phase 6) have **not** been executed. Host access controls (4.D) have **not** been executed. Items still marked "to test" remain unverified.
 
 **Main open problem:** none on revocation. On PostgreSQL a role revoked while the primary is down is refused by the replica within one reconciler interval plus 2 s (replica-side deny list, 5.4).
 
@@ -94,6 +94,9 @@ GDPR angle (EU): data minimization means masking by default; audit logs show who
 | MariaDB Community Server + bundled `server_audit` plugin | GPL-2.0 | Database for the Laravel API, with audit logging. |
 | WireGuard | GPL-2.0 | VPN for developer and operator access. |
 | Fluent Bit | Apache-2.0 | Ships logs off the hosts. |
+| Grafana Alloy | Apache-2.0 | Debug telemetry collector (OTLP and Faro); redacts personal data before storage (phase 5). |
+| Grafana, Loki, Tempo | AGPL-3.0 | Debug telemetry: dashboards and Explore, logs, traces (phase 5). Not the audit store. |
+| OpenTelemetry SDKs (.NET, PHP), Grafana Faro Web SDK | Apache-2.0 | Traces and logs from the APIs and the browser (phase 5). |
 | nginx | BSD-2-Clause | Serves the Angular app, reverse proxy to the APIs. |
 | .NET / Npgsql / Laravel / Angular | MIT / PostgreSQL License / MIT / MIT | Application stack. |
 | Docker Engine | Apache-2.0 | Container runtime. Docker Desktop is commercial, covered by the existing subscription. |
@@ -104,7 +107,6 @@ GDPR angle (EU): data minimization means masking by default; audit logs show who
 |---|---|---|
 | Warpgate | Apache-2.0 | Bastion. Gives query **logs** for database sessions; replayable recording only for SSH, Kubernetes, RDP and VNC. |
 | GlitchTip | MIT | Error tracking (Sentry-compatible SDKs). |
-| Grafana + Loki | AGPL-3.0 | Central log store and dashboards. |
 | OpenSearch | Apache-2.0 | Alternative central log store. |
 | CloudBeaver Community | Apache-2.0 | Web SQL client, if developers should not need a local client. |
 
@@ -114,6 +116,7 @@ GDPR angle (EU): data minimization means masking by default; audit logs show who
 - `server_audit` ships with MariaDB Community Server but is not loaded by default (`plugin_load_add = server_audit`). It is not the paid MariaDB Enterprise Audit plugin.
 - Grafana, CloudBeaver and nginx also have paid editions (Grafana Enterprise, CloudBeaver Enterprise, NGINX Plus). Nothing here depends on them.
 - GlitchTip: only the backend repository licence was checked.
+- Phase 5 additions (Alloy, Grafana, Loki, Tempo, OpenTelemetry .NET and PHP, Faro Web SDK, Npgsql.OpenTelemetry) were checked on 2026-11-23 against each project's GitHub licence record and the package registries (NuGet, Packagist, npm). Grafana moved from 3.2 to 3.1 with phase 5.
 
 ### 3.3 Excluded
 
@@ -461,6 +464,8 @@ Measured:
 
 Not shipped: auditd and Docker events (see 4.D).
 
+**Debug telemetry is a separate pipeline (phase 5).** Application traces and logs (OpenTelemetry, Faro) go through Grafana Alloy to Loki and Tempo, which developers read in Grafana. That pipeline is developer-readable, redacted and short-lived (7 days of logs, 72 hours of traces in the lab), so it is **not** part of the audit trail and never receives audit records. It shares no volume or network with Fluent Bit and the store (tested). Redaction happens twice: the apps record SQL only in parameterized form and log no customer fields, and Alloy masks e-mail addresses and deletes query strings, bodies and SQL parameter values before storage (tested with sentinel values).
+
 **Alerts (lab form).** Fluent Bit rules write an alerts stream to a separate file:
 
 | Rule | Fires on |
@@ -774,7 +779,7 @@ Notes:
 - Timeouts set with `ALTER ROLE ... SET` are defaults. The user can override them with `SET`. They are a guard rail, not a control.
 - Do not use `DO` blocks in statements: the plugin splits statements on semicolons.
 - The termination in the PostgreSQL revocation statement runs on the primary only. Temp users cannot log in there, so it matters only as defence in depth. See 5.4 for the replica.
-- The `app1-pg-rw` break-glass role follows the same pattern with `default_ttl=30m max_ttl=30m`, a separate write role in place of `debug_ro`, and its own `pg_hba.conf` line on the primary. Its details are for phase 5.
+- The `app1-pg-rw` break-glass role follows the same pattern with `default_ttl=30m max_ttl=30m`, a separate write role in place of `debug_ro`, and its own `pg_hba.conf` line on the primary. Its details are for phase 6.
 
 ### 5.4 Sessions outlive revocation
 
@@ -1040,7 +1045,8 @@ Goal: prove all five workstreams end to end on disposable infrastructure: a Wind
 | 2 Workstream C, primaries only | OpenBao from a real config file (single-node integrated Raft storage, one Shamir key share for the lab, declarative audit device), not dev mode: dev mode loses rotated passwords and leases on restart. Keycloak realm with group `app1-devs` and two test users, one in the group, one not. Section 5 configuration. In this phase only, temp users were allowed on the primary (the no-replica fallback from 4.C). | Credentials issue; outsider denied. | Done 2026-11-16 (13 smoke, 38 hardening, 83 access checks). |
 | 3 Replicas | PostgreSQL streaming replica (`pg_basebackup` bootstrap), MariaDB replica (`server_id`, binlog, GTID), `pg_hba.conf` split, sweepers. | Replica tests in 7.4 pass. | Done 2026-11-17. Streaming replica and GTID replica over verified TLS, `pg_hba.conf` split, primaries off the access network, sweepers, stale-user report (13 smoke, 38 hardening, 83 access, 93 replica checks). |
 | 4 Workstream E | pgAudit (custom image) and `server_audit` on all servers, Fluent Bit to a volume only the log container mounts. | Audit tests in 7.4 pass. | Done 2026-11-17. pgAudit and `server_audit` on all four servers, Fluent Bit to an isolated store, lab alert rules, MariaDB binary-log password leak fixed by replica-only temp users and hash-only password statements. Revocation backstops: MariaDB startup purge and replica-local expiry event, a lease reconciler for both engines, and a PostgreSQL replica-side deny list (watcher inside pg-replica), with eight new alerts (13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently)). |
-| 5 Optional | Approval portal, Warpgate, break-glass role and alert. | As scoped then. | Not started. |
+| 5 Debug telemetry (principle 1) | Traces and logs from the browser (Grafana Faro) and both APIs (OpenTelemetry) through Grafana Alloy to Loki and Tempo, read in Grafana with Keycloak sign-in. Redaction before storage. Configuration adapted from the existing `telemetries` repository. Separate from the audit pipeline. | One request gives one trace browser -> API -> SQL with correlated logs; sentinel personal data appears in no trace or log line; no telemetry container touches an audit volume; Grafana admits `app1-devs` only. | Done 2026-11-23 (27 phase 5 checks, 13 smoke; phase 4 suite on the phase 5 stack 94 of 96, see 7.5). Browser path also checked by hand in a real browser. |
+| 6 Optional | Approval portal, Warpgate, break-glass role and alert. | As scoped then. | Not started. |
 
 ### 7.3 Windows notes
 
@@ -1052,7 +1058,7 @@ Goal: prove all five workstreams end to end on disposable infrastructure: a Wind
 
 ### 7.4 Acceptance tests
 
-All items below were proven in phases 0 to 4. None is unmet.
+All items below were proven in phases 0 to 5. None is unmet.
 
 - [x] Credentials issue and work (on the primary in phase 2).
 - [x] Credentials work on the replica.
@@ -1077,8 +1083,16 @@ All items below were proven in phases 0 to 4. None is unmet.
 - [x] No cleartext temp password appears in database logs. Met on both engines. PostgreSQL: pgAudit redaction, SCRAM, `log_statement = none`. MariaDB: replica-only temp users, also proven by a pattern scan of every decoded binary and relay log (see 4.E).
 - [x] The apps still pass smoke tests after every phase (phases 0 to 4).
 - [x] The `docker exec` bypass is documented and its alert fires (as `superuser_login`). No notification channel yet.
+- [x] Phase 5: one request gives one trace across browser, API and SQL, and the request's log lines carry the same `trace_id` (both APIs; browser path checked by hand).
+- [x] Phase 5: customer data sent through both APIs appears in no trace and no log line; SQL is recorded with placeholders only; e-mail addresses in browser logs are masked.
+- [x] Phase 5: no telemetry container mounts an audit volume or the store; the apps reach Alloy but not Loki, Tempo or Grafana; only Grafana is published, on loopback; Loki holds no audit records.
+- [x] Phase 5: Grafana admits only Keycloak users in `app1-devs` (Viewer with Explore, no write permissions); others, anonymous access and the local admin over HTTP are refused.
 
 ### 7.5 Known weaknesses found in the prototype
+
+- **Phase 5, host-to-container requests (open).** On the phase 5 stack, `phase4-checks.ps1` fails 2 of 96 checks in two runs: some of its Windows PowerShell requests to `http://localhost:8080` (4 Laravel POSTs during the churn, and a few of 20 GETs) time out. nginx logged every request it received as 200 or 201 and logged no 499 or 504, so the lost requests never reached the container: they were dropped in Docker Desktop's port forwarding. In a separate probe, `Invoke-WebRequest` lost 3 of 40 requests to `127.0.0.1:8080` and none of 40 to `localhost`; curl lost none of 120. Not yet determined: whether the phase 4 stack shows the same on this host now, and whether the extra load of phase 5 contributes. The two checks' database and replication assertions pass.
+- **Phase 5 memory.** Grafana 13 needs about 430 MiB right after start; with a 192 MiB limit its first start stalled at full CPU, so the limit is 512 MiB with `GOMEMLIMIT=350MiB`. The telemetry services together use about 810 MiB; the whole phase 5 stack about 1.9 GiB.
+- **Phase 5 lab shortcuts.** OTLP and the store APIs have no TLS and no authentication (isolation by internal networks only); every trace is sampled; Grafana's `viewers_can_edit` is deprecated in Grafana 13 (it still gives Viewers Explore; a custom role will be needed when it is removed).
 
 - **MariaDB revocation no longer depends on the replica being reachable for logins** (three backstops, 5.4). Residual: every replica restart also drops the users of valid leases; a failed `bao lease revoke -sync` is still not retried (its user goes at the next replica start or at lease expiry).
 - **PostgreSQL primary outage (closed by the replica deny list, 5.4).** Residual risks:

@@ -1,6 +1,6 @@
 # Security prototype
 
-Phase 0 (`compose.phase0.yaml`) is the insecure baseline. Phase 1 (`compose.phase1.yaml`) is the hardened version of the same stack; see "Phase 1: hardened stack" below. Phase 2 (`compose.phase2.yaml`) adds just-in-time developer access through OpenBao and Keycloak; see "Phase 2" below. Phase 3 (`compose.phase3.yaml`) moves developer access to read replicas and adds session sweepers; see "Phase 3" below. Phase 4 (`compose.phase4.yaml`) adds database audit logging, log shipping to a separate store and lab alert rules; see "Phase 4" below.
+Phase 0 (`compose.phase0.yaml`) is the insecure baseline. Phase 1 (`compose.phase1.yaml`) is the hardened version of the same stack; see "Phase 1: hardened stack" below. Phase 2 (`compose.phase2.yaml`) adds just-in-time developer access through OpenBao and Keycloak; see "Phase 2" below. Phase 3 (`compose.phase3.yaml`) moves developer access to read replicas and adds session sweepers; see "Phase 3" below. Phase 4 (`compose.phase4.yaml`) adds database audit logging, log shipping to a separate store and lab alert rules; see "Phase 4" below. Phase 5 (`compose.phase5.yaml`) adds debug telemetry (traces and logs in Grafana) for reproducing bugs without database access; see "Phase 5" below.
 
 ## Phase 0
 
@@ -396,6 +396,64 @@ Remove-Item .\secrets\openbao_phase4_unseal_key, .\secrets\openbao_phase4_root_t
 ```
 
 `-v` also deletes the log volumes and the store. Keep `secrets\openbao_phase4_reconciler_role_id` and `_secret_id`: they are worthless after the wipe (the next `phase4-setup.ps1` replaces them), but if they are missing at `up`, Docker creates directories in their place. If you deleted them, run `gen-secrets.ps1` before `up`.
+
+## Phase 5: debug telemetry
+
+`compose.phase5.yaml` (project `security-prototype-phase5`) is phase 4 plus debug telemetry: one request in the Angular app becomes one trace across browser, API and SQL, with the log lines of that request attached, viewable in Grafana. This is principle 1 of `prod-db-access-hardening.md` ("remove the need first"): most bugs should be reproducible from telemetry, without just-in-time database access. Phase 4 and phase 5 use the same subnets and host ports, so only one of them can run at a time.
+
+The configuration is adapted from the `balagus/telemetries` repository (commit `91f6f8d`) and copied into `config/telemetry/`:
+
+- **Grafana Alloy** (`alloy`, Apache-2.0) is the only entry point. The APIs send OTLP (`dotnet-api` gRPC 4317, `laravel-api` HTTP 4318); the browser sends Faro payloads to `/faro/collect` on the app's own origin, which nginx proxies to `alloy:12347`. Alloy publishes no port.
+- **Redaction before storage** (`config/telemetry/alloy/config.alloy`): e-mail addresses are masked as `<email>` in span attributes, span events and log bodies; query strings, request and response bodies and SQL parameter values are deleted. Browser logs get the same masking. The apps add their own layer: SQL is recorded only in parameterized form (`VALUES (@p0, @p1)`, `values (?, ?)`), and handlers log counts and ids, never customer fields.
+- **Loki** (logs, 7 days) and **Tempo** (traces, 72 hours), AGPL-3.0, single binary, filesystem storage. There is no MinIO and no Mimir: no metrics backend in the lab (memory).
+- **Grafana** (AGPL-3.0) on `http://localhost:3000` (`127.0.0.1` only), the only new published port. Sign-in is through Keycloak only (client `grafana` in `config/keycloak/phase5/lab-realm.json`): members of `app1-devs` become Viewer with Explore (`viewers_can_edit`; nothing can be saved), everyone else is refused (`role_attribute_strict`). Login form, basic auth, anonymous access and sign-up are off. The local admin `lab-admin` exists only for `grafana cli` inside the container; its password is a Docker secret.
+- **Networks**: `telemetry` (internal: `alloy`, `dotnet-api`, `laravel-api`, `web`) and `telemetry-store` (internal: `alloy`, `loki`, `tempo`, `grafana`). The apps cannot reach the stores.
+- **Not the audit trail.** `fluent-bit`, `log-store` and every audit volume are exactly as in phase 4. No telemetry container mounts any of them, and Loki holds no audit records. Telemetry is developer-readable and redacted; the audit store is neither.
+- **App images** read the standard `OTEL_*` settings and stay silent without them, so phases 0 to 4 (same app code) send nothing. The web image enables Faro only with the build arg `FARO_ENABLED=true`. The Faro API key (`lab-faro-app1-web` in the compose file) is not a secret: it ships in the browser bundle and only makes Alloy drop payloads from elsewhere.
+
+LAB-ONLY, in addition to the phase 4 list: the phase 5 OpenBao instance keeps its keys in `secrets\openbao_phase5_*`; the Grafana admin password and the Keycloak client secret are plain files `secrets\grafana_admin_password` and `secrets\keycloak_grafana_client_secret`; Loki, Tempo and Alloy talk plain HTTP/gRPC on the internal networks without authentication (production: TLS and authentication on OTLP, see `docs/best-practices.md` in the telemetries repository); every trace is kept (`parentbased_always_on`).
+
+### Start and set up
+
+```powershell
+docker compose -f compose.phase4.yaml down
+powershell -ExecutionPolicy Bypass -File .\scripts\gen-secrets.ps1
+docker compose -f compose.phase5.yaml up -d --build
+powershell -ExecutionPolicy Bypass -File .\scripts\phase5-setup.ps1
+```
+
+`phase5-setup.ps1` runs `phase4-setup.ps1` against the phase 5 stack (`-ComposeFile`, `-Project`, `-BaoSecretPrefix openbao_phase5`; the phase 4 script now takes these parameters with the phase 4 defaults), then waits until Loki and Tempo report ready (checked from a throwaway curl container on `telemetry-store`), `alloy` is running and Grafana is healthy. Grafana's first start takes about 20 seconds. `gen-secrets.ps1` now also writes the two Grafana secrets and the phase 5 reconciler placeholders.
+
+### Test
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\phase5-checks.ps1
+powershell -ExecutionPolicy Bypass -File .\tests\smoke.ps1 -Phase 5
+powershell -ExecutionPolicy Bypass -File .\tests\phase4-checks.ps1 -ComposeFile .\compose.phase5.yaml -Project security-prototype-phase5 -BaoSecretPrefix openbao_phase5
+```
+
+`phase5-checks.ps1` (about two minutes, 27 checks) sends requests with a known `traceparent` and finds the trace in Tempo with the API span and the PostgreSQL or MariaDB span, and the log lines with the same `trace_id` in Loki; posts Faro payloads through nginx with a wrong and the right API key and finds the browser log line in Loki with the e-mail masked; creates a customer with random sentinel values through both APIs and shows that neither the INSERT traces nor any log line contains them and that the recorded SQL has placeholders; checks that no telemetry container mounts an audit volume, that `fluent-bit` still has no network, that the telemetry containers run read-only without capabilities and not as root, that the apps reach Alloy but not Loki, Tempo or Grafana, that only `127.0.0.1:3000` is published, and that Loki holds no audit material; and checks Grafana: anonymous and basic-auth access refused, `/login` sends to Keycloak, no secret in the container environment, a scripted Keycloak sign-in as `alice` (Viewer, Explore, Tempo and Loki through Grafana, no write permissions) and as `bob` (password accepted by Keycloak, refused by Grafana). Queries to Loki and Tempo run in a throwaway `curlimages/curl` container on `telemetry-store`.
+
+Measured on 2026-11-23: `phase5-checks.ps1` 27 of 27, `smoke.ps1 -Phase 5` 13 of 13, `phase4-checks.ps1` on the phase 5 stack 94 of 96. The two failures are app requests from Windows PowerShell that never reached nginx (dropped in Docker Desktop's port forwarding; see 7.5 of the design document). Memory: about 1.9 GiB for the whole stack, of which Grafana about 430 MiB, Alloy 150, Tempo 130, Loki 100.
+
+### Look at a trace
+
+Open http://localhost:8080 and click through the app. Then open http://localhost:3000, sign in as `alice` (password in `config\keycloak\phase5\lab-realm.json`, LAB-ONLY), open **Explore**, choose **Tempo**, **Search**, service `dotnet-api` or `laravel-api` or `web`. A trace shows the browser span, the API span and the SQL span; **Logs for this span** opens the matching lines in Loki. In Loki, `{service_name="laravel-api"}` lists the API's log lines; each has a `trace_id` link back to Tempo.
+
+### Unseal after a restart
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\phase2-unseal.ps1 -ComposeFile .\compose.phase5.yaml -Project security-prototype-phase5 -BaoSecretPrefix openbao_phase5
+```
+
+### Stop and wipe
+
+```powershell
+docker compose -f compose.phase5.yaml down -v
+Remove-Item .\secrets\openbao_phase5_unseal_key, .\secrets\openbao_phase5_root_token
+```
+
+`-v` also deletes the telemetry volumes (`loki-data`, `tempo-data`, `grafana-data`) along with the phase 4 volumes of this project. Keep `secrets\openbao_phase5_reconciler_role_id` and `_secret_id` for the same reason as in phase 4.
 
 ## Memory on an 8 GB host
 
