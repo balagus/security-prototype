@@ -1,11 +1,11 @@
 # Production Security, Database and Access Hardening: Proposal and Prototype Plan
 
 Date: 2026-11-17
-Revision 7
+Revision 8
 
-**Status:** Phases 0 to 4 were executed in the prototype: sections 4.A, 4.B, 4.C (replica path), 4.E (database audit and shipping) and 5. Test counts against the phase 4 stack: 13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 81 revocation checks (85 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently). The MariaDB binary-log password leak found in phase 4 is fixed and tested (4.E, 5.3). The approval portal, Warpgate and break-glass (phase 5) have **not** been executed. Host access controls (4.D) have **not** been executed. Items still marked "to test" remain unverified.
+**Status:** Phases 0 to 4 were executed in the prototype: sections 4.A, 4.B, 4.C (replica path), 4.E (database audit and shipping) and 5. Test counts against the phase 4 stack: 13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently). The MariaDB binary-log password leak found in phase 4 is fixed and tested (4.E, 5.3). The approval portal, Warpgate and break-glass (phase 5) have **not** been executed. Host access controls (4.D) have **not** been executed. Items still marked "to test" remain unverified.
 
-**Main open problem:** on PostgreSQL, a role revoked while the primary is down can still log in to the replica until its `VALID UNTIL` (see 5.4).
+**Main open problem:** none on revocation. On PostgreSQL a role revoked while the primary is down is refused by the replica within one reconciler interval plus 2 s (replica-side deny list, 5.4).
 
 ---
 
@@ -270,7 +270,7 @@ Consequences:
 - MariaDB: no replication step. Credentials give a working login on the replica in under 2 s, and revocation ends sessions in about 0.8 s (5.4).
 - MariaDB: one OpenBao connection and role per replica. Not built for more than one.
 - MariaDB: a replica outage delays OpenBao's revocation, but it no longer leaves a working login. The replica drops every temp user at each start before it answers any connection (startup purge). A replica-local event drops temp users older than `max_ttl` plus a margin. A lease reconciler completes pending and irrevocable revocations once the replica is reachable again (5.4). A replica restart also drops the users of still-valid leases; those developers request new credentials.
-- PostgreSQL: if the primary is down when a lease is revoked or expires, the role stays on the replica and can log in there until its `VALID UNTIL`. When the primary returns, the reconciler revokes the lease, the role is dropped and replicates, and the sweeper ends its sessions (5.4).
+- PostgreSQL: if the primary is down when a lease is revoked, the role stays on the replica, but the lease reconciler writes a deny descriptor and the replica's watcher rejects it in pg_hba and terminates its sessions, within one reconciler interval plus 2 s (measured 3.8 to 12.7 s, lab interval 15 s). A role issued in the same seconds by the same OpenBao role is refused too (accepted over-deny). Expiry needs nothing: VALID UNTIL replicates and the standby enforces it. When the primary returns, the reconciler revokes the lease, the DROP ROLE replicates and the deny entry is released (5.4).
 - MariaDB: a re-seeded replica loses its temp users. This is acceptable. `DROP USER IF EXISTS` keeps revocation working.
 
 **Fallback if production has no replicas.** Point the read-only role at the primary, restricted by firewall and `pg_hba.conf` / host mask, with forced timeouts and connection limits. Add replicas later.
@@ -446,7 +446,7 @@ Container hardening:
 
 Flow:
 - Databases, OpenBao and the sweepers write log files to their own volumes. Fluent Bit mounts each of them **read-only**.
-- Sources: PostgreSQL jsonlog, `server_audit` text (parsed by regex), OpenBao audit JSON, sweeper logs, the MariaDB replica's backstop lines (one file per startup purge and per expiry run that dropped users, written by the server with `SELECT ... INTO OUTFILE` into its `--secure-file-priv` directory on its own audit volume) and the lease reconciler's log (5.4). The OpenBao audit file is written with mode 0640 to a group-readable volume.
+- Sources: PostgreSQL jsonlog, `server_audit` text (parsed by regex), OpenBao audit JSON, sweeper logs, the MariaDB replica's backstop lines (one file per startup purge and per expiry run that dropped users, written by the server with `SELECT ... INTO OUTFILE` into its `--secure-file-priv` directory on its own audit volume), the lease reconciler's log (5.4) and pg-replica's deny-list watcher log (`pg-replica-log/pg-deny/`). The OpenBao audit file is written with mode 0640 to a group-readable volume.
 - A Lua filter normalises records to JSON lines: timestamp, source server, engine, user, client host, event, statement.
 - The store volume is mounted **only** by Fluent Bit (verified by inspecting every container's mounts).
 - Healthcheck connect and disconnect records are dropped by the shipper (about 100k lines a day per server).
@@ -474,6 +474,12 @@ Not shipped: auditd and Docker events (see 4.D).
 | `replica_expiry_backstop` | The replica dropped `v-` users older than `max_ttl` plus the margin: OpenBao failed to revoke them. |
 | `irrevocable_lease_found` | The reconciler found an irrevocable database lease. |
 | `revocation_retried_by_reconciler` | The reconciler re-revoked a pending or irrevocable lease. Fires on every attempt, outcome ok or failed. |
+| `pg_replica_deny_applied` | pg-replica now refuses the temp role(s) of a lease whose revocation is pending or irrevocable. Names the roles, the sessions terminated and the over-deny. |
+| `pg_deny_descriptor_rejected` | A file in the descriptor volume failed validation (bug or compromised reconciler). |
+| `pg_deny_watcher_failed` | The watcher was restarted, its supervisor stopped, the descriptor directory is unreadable, or a rewrite or reload failed. |
+| `pg_server_process_crashed` | The postmaster saw a child die abnormally and restarted every session. |
+
+The PostgreSQL superuser-login exception also covers the deny-list watcher (local socket and `application_name=pg-deny-watcher`, which a local superuser could fake).
 
 - `superuser_login` is noisy: about 600 alerts in one full test cycle, because every `docker exec` by an operator logs in as a superuser. This is correct behaviour. It is the "`docker exec` bypass" alert from 7.4.
 - Nothing sends notifications yet.
@@ -564,6 +570,7 @@ The replication line is needed for streaming replication. The keyword `all` in t
 ```
 # replica
 local   all          postgres                         peer
+host    all          @/var/lib/postgresql/pg-deny/denied_roles  all  reject
 host    all          bao_admin        all             reject
 hostssl app1         +debug_ro        <access-subnet> scram-sha-256
 hostssl app1         session_sweeper  <sweeper-ip>/32 scram-sha-256
@@ -571,7 +578,9 @@ host    replication  all              all             reject
 host    all          all              all             reject
 ```
 
-The `bao_admin` ordering trap is real. `bao_admin` is a member of `debug_ro` (ADMIN only, INHERIT and SET false), so it matches `+debug_ro`. On the primary, the `bao_admin` allow line must come before `host all +debug_ro all reject`. On the replica, an explicit `host all bao_admin all reject` line comes first. The order above was verified working; the reversed order was not run.
+Line 2 is the replica-side deny list (5.4). Its include file is written only by the watcher inside the replica (owner `postgres`, 0600, not on any shared volume) and always starts with the sentinel `/^$`. Measured on PostgreSQL 17: an `@file` with no token is a parse error (the server does not start; a reload keeps the old rules), regular expressions work inside it, and `all`, `+group`, `@file` and comma lists inside it are interpreted, and quoting does not neutralise a `/regex`. The file therefore contains only `/^v-...$` patterns built from validated input. The replica image now includes tini (MIT licence).
+
+The `bao_admin` ordering trap is real. `bao_admin` is a member of `debug_ro` (ADMIN only, INHERIT and SET false), so it matches `+debug_ro`. On the primary, the `bao_admin` allow line must come before `host all +debug_ro all reject`. On the replica, an explicit `host all bao_admin all reject` line comes before the allow lines (after the deny-list line, 5.4). The order above was verified working; the reversed order was not run.
 
 Temp users can log in on the replica only. The same credentials are rejected on the primary. The primary is not on the `access` network, and it refuses them at authentication from the app and replication networks.
 
@@ -834,7 +843,7 @@ MariaDB has no `VALID UNTIL`, so the MariaDB sweeper only handles dropped accoun
 
 The PostgreSQL TTL figure can exceed the interval. It includes OpenBao's expiry processing, and `VALID UNTIL` lands about 5 s after the lease's expiry time.
 
-#### Revocation when the database is unreachable (MariaDB: closed; PostgreSQL: open)
+#### Revocation when the database is unreachable (both engines closed)
 
 MariaDB temp users live only on the replica, so OpenBao must reach it to revoke.
 - If the replica is down when a lease is revoked or expires, OpenBao queues the revocation. OpenBao retries with growing, jittered delays and logs each `next_attempt`. Measured examples: 26 s, 22 s, 43 s, 3m12 s for one lease; 29 s, 35 s, 1m41 s for another. After 6 attempts the lease becomes irrevocable (542.8 s in the final run; 10 to 11 minutes in earlier runs).
@@ -844,22 +853,29 @@ MariaDB temp users live only on the replica, so OpenBao must reach it to revoke.
 - `bao lease revoke -sync` during the outage fails and is not retried. The lease keeps its TTL.
 - The sweeper cannot close the gap, because it has no OpenBao state.
 
-Built (lab), three layers:
+Built (lab), four layers (1 to 3 for MariaDB, 3 and 4 for PostgreSQL):
 1. **Startup purge.** `maria-replica` runs an `--init-file`, generated by a wrapper entrypoint from a template. It starts with `SET SESSION sql_log_bin=0`, drops every `'v-%'` user from `mysql.global_priv` before the server answers any connection, and writes a line with `SELECT ... INTO OUTFILE` into a `--secure-file-priv` directory on its audit volume (`/var/log/mariadb-audit/backstop`, mode 2750).
 2. **Expiry backstop.** A replica-local event `replica_local.revocation_backstop` runs `EVERY 15 s` in the lab (proposal: 300 s with a 900 s margin in production), with `sql_log_bin=0`. Its definer is `'revocation_backstop'@'localhost'` (locked, local, no password). It parses the unix time in the user name with `(?<=-)[0-9]{10}(?=-[^-]+$)`. For `v-` users older than `max_ttl` (14400 s) plus the margin (lab 300 s), it does `ALTER USER ... ACCOUNT LOCK`, `KILL USER`, `DROP USER`, then writes a log line. Definer privileges: `CREATE USER`, `READ ONLY ADMIN`, `BINLOG ADMIN`, `CONNECTION ADMIN`, `FILE` (limited by `--secure-file-priv`), `SELECT (User, Host) ON mysql.global_priv`, `EVENT ON replica_local.*`. Each was measured by removal: without `CONNECTION ADMIN` the session survives; without `FILE` the drop happens but the log line and the alert are lost. Events arriving from the primary are created `SLAVESIDE_DISABLED` (tested). **Warning:** `ALTER EVENT` without a `DEFINER` clause makes the user running it (root) the definer (measured). A replica restart re-creates the event from the `init_file`. Setup refuses to finish unless the event is `ENABLED` with the correct definer.
-3. **Lease reconciler.** A container (`openbao/openbao:2.7.2` image, user 100:1000, `read_only`, `cap_drop ALL`, 64m, `no-new-privileges`) on its own internal network `bao-reconciler` (10.81.10.0/24) at 10.81.10.20; OpenBao joins it at 10.81.10.10. A shell loop runs every 15 s in the lab (60 s proposed). It logs in with AppRole (5.2; policy in 5.5), lists irrevocable leases (`GET sys/leases?type=irrevocable`) and revokes those under `database/creds/` (`sync=true`). It also lists `database/creds` leases, looks up the TTL, and re-revokes leases with `ttl<=0` seen on two consecutive passes (pending revocations), with a per-lease backoff (at most 2 passes in the lab). It logs `action=start`, `ready`, `error`, `recovered`, `irrevocable-found`, `revoke-irrevocable` and `revoke-retried`, each with an outcome.
+3. **Lease reconciler.** A container (`openbao/openbao:2.7.2` image, user 100:1000, `read_only`, `cap_drop ALL`, 64m, `no-new-privileges`) on its own internal network `bao-reconciler` (10.81.10.0/24) at 10.81.10.20; OpenBao joins it at 10.81.10.10. A shell loop runs every 15 s in the lab (60 s proposed). It logs in with AppRole (5.2; policy in 5.5), lists irrevocable leases (`GET sys/leases?type=irrevocable`) and revokes those under `database/creds/` (`sync=true`). It also lists `database/creds` leases, looks up the TTL, and re-revokes leases with `ttl<=0` seen on two consecutive passes (pending revocations), with a per-lease backoff (at most 2 passes in the lab). It logs `action=start`, `ready`, `error`, `recovered`, `irrevocable-found`, `revoke-irrevocable` and `revoke-retried`, each with an outcome. It now also writes the PostgreSQL deny descriptors (layer 4).
 
 Measured:
 - The purge completed 3.36 s and 2.84 s after `docker compose start maria-replica`.
 - The expiry backstop dropped a backdated user 8.0 s and 8.1 s after the event was enabled, and killed its session 7.4 s and 7.5 s after. Nothing was binlogged and the alert shipped.
 - The reconciler completed a pending MariaDB revocation 8.4 s and 26.7 s after `maria-replica` was healthy, and a PostgreSQL one 9.0 s and 27.3 s after `pg-primary` was healthy. OpenBao's own next retries were due 108 to 227 s after the start.
 
-**PostgreSQL exposure (open).** If the primary is down when a lease is revoked or expires, the role stays on the replica. During a 150 s primary outage the revoked role logged in to `pg-replica` in 10 of 10 attempts, and its open session stayed. The bound is the role's `VALID UNTIL` (lease end, 1 h default, up to `max_ttl` 4 h with renewals). After the primary returned, the reconciler revoked the lease. The role was gone from the replica 14.8 s and 35.1 s after the start command in two runs, and the sweeper ended the session 24.9 s and 30.2 s after it.
+4. **PostgreSQL replica deny list (built, lab).** While the primary is down, the standby cannot drop a revoked role.
+   - **Reconciler.** For every lease of a listed PostgreSQL role (`PG_DENY_ROLES`) with TTL <= 0 (from the first pass that sees it) or irrevocable, the reconciler writes `<role>.<lease suffix>.deny` containing exactly `v1 <role> <issue_time unix>` into a volume. It writes a dot-file and renames it, and needs no new permission: `issue_time` comes from `sys/leases/lookup`. Only the reconciler mounts the volume read-write; the replica mounts it read-only; they share no network. The reconciler removes the file once OpenBao answers "invalid lease", never on another error. MariaDB leases get none.
+   - **Watcher.** It runs inside the replica as `postgres`, started by the entrypoint under `tini -s` (child subreaper). The server remains PID 1. PostgreSQL 17 treats any unknown child of the postmaster that dies by a signal or with an exit code other than 0 or 1 as a crashed backend and restarts every session (measured), so nothing the watcher forks may be reaped by the postmaster.
+   - **Validation.** Accepted: regular files only, a strict name pattern, at most 129 bytes read with nofollow/nonblock, exactly one line, a role equal to the file name's and on an allowlist, a 10-digit time not in the future. Anything else is logged and alerted (content never logged) and ignored.
+   - **Patterns.** Each valid descriptor becomes `/^v-.+-<role, 12 chars>-(<t-3>..<t>)-[A-Za-z0-9]{4}$`. The username's unix time is taken just before the lease is created: measured 0 s in 29 of 30 leases, 1 s once.
+   - **Apply.** The watcher writes the include file, checks it with `pg_hba_file_rules`, reloads with `pg_ctl reload` (which works on a standby), and terminates matching sessions with `pg_terminate_backend` over the local socket.
+   - **Restarts.** The entrypoint writes the file before the server starts, so a restart has no login window.
+   - **Release.** When the descriptor is gone, an entry is released once no role matches it. If a role still matches (another role of the same seconds), it is released 60 s later and only while the standby is streaming.
+   - **Fail-safe.** The server always starts (the sentinel is written even if the step fails); a missing descriptor directory is logged and alerted; the supervisor restarts a dead watcher and alerts; a SIGTERM to the supervisor is alerted and the current file stays in effect (the healthcheck turns unhealthy after 30 s without a heartbeat); SIGKILL of the supervisor or tini crash-restarts every replica session (alerted).
+   - **Measured** (four runs, 180 s outages, lab reconciler interval 15 s): revoked role refused 3.8 to 12.7 s after the revoke and never again during the outage (0 successes in 321 to 332 attempts); its open session ended 3.6 to 12.5 s after the revoke. A still-valid role of another second was unaffected (31/31, 34/34 logins, session kept); a still-valid role of the same second was refused (over-deny, logged as `matched=2`). A replica restart during the outage wrote the deny list about 0.5 s before the first accepted login: 0 revoked logins in 9 to 13 attempts. After the primary returned the reconciler completed the revocation 1.3 to 18.5 s after it was healthy (OpenBao's own retry was 102 to 217 s away); the role was dropped on the replica 9.6 to 26.9 s and the deny list was back to the sentinel 83 to 104 s after the start command. `kill -9` of the watcher: restarted in about 1 s. 23 malicious descriptors (quotes, newlines, `all`, `+group`, `@file`, `replicator`, `bao_admin`, `postgres`, path traversal, symlink, oversized, FIFO and others) were rejected with `pg_hba` unchanged.
+   - **Formerly** (before the deny list): the revoked role logged in 10 of 10 times during a 150 s outage, bounded by `VALID UNTIL`.
 
-Proposals (not built):
-- A replica-side deny list: the reconciler or the sweeper writes reject lines for revoked roles into a `pg_hba` include on the standby and calls `pg_reload_conf()`, which works on a standby.
-- A shorter PostgreSQL `default_ttl`.
-- A runbook to promote the standby during long outages.
+Remaining proposals: a shorter PostgreSQL `default_ttl`; a runbook to promote the standby during long outages; a cross-host descriptor transport for replicas on other hosts.
 
 **Stale-user detection.** A report-only detector logs `v-` accounts past their maximum lifetime. PostgreSQL is checked on the primary by `rolvaliduntil`; MariaDB is checked on the replica by account age. It does not drop them. It was built and tested in phase 3. This catches leases OpenBao could not revoke: after 6 failed attempts a lease becomes irrevocable and the DB user stays.
 
@@ -952,6 +968,7 @@ path "sys/leases" {
 - Each rule was measured by removal: each removal makes exactly its own call return 403. Both `sudo` capabilities are needed.
 - Refused to the reconciler token (tested): `database/creds/*`, config, roles, `rotate-root`, policies, its own role ID, token create, `lookup-self`, renew, asynchronous revoke, `revoke-prefix`, `revoke-force`, the path form `sys/leases/revoke/<id>`, non-database leases, `sys/mounts` and cubbyhole. A login from another address on the same network was refused.
 - Its credentials appear in no process listing, container configuration, `docker logs`, reconciler log, OpenBao audit log or store.
+- Unchanged by the deny list: the issue time is part of the `sys/leases/lookup` response the policy already allows (the response is not filtered by policy; measured).
 
 Audit device. Since OpenBao 2.3.2, `bao audit enable` over the API is refused unless `unsafe_allow_api_audit_creation = true`. Declare it in the server config instead:
 
@@ -991,7 +1008,7 @@ bao token revoke -self
 - **Approvals are not built into OpenBao.** That is the job of the portal (4.C).
 - **OpenBao is critical infrastructure and the trust root.** Plan unsealing, backups, and who holds unseal keys. Revoke the root token after setup.
 - **PostgreSQL replica lag** delays both new credentials and revocation. An orphaned session keeps running until the sweeper kills it (5.4).
-- **Revocation during a database outage.** MariaDB is covered by the startup purge, the expiry event and the lease reconciler (5.4). On PostgreSQL a role revoked while the primary is down can still log in to the replica until its `VALID UNTIL` (5.4).
+- **Revocation during a database outage.** MariaDB is covered by the startup purge, the expiry event and the lease reconciler (5.4). On PostgreSQL a role revoked while the primary is down is refused by the replica's deny list within one reconciler interval plus 2 s (5.4). The deny list has its own limits (7.5).
 - **Hot-standby query cancellation.** Long debug queries on a PostgreSQL replica can be cancelled, or cause bloat with `hot_standby_feedback`. Keep statement timeouts.
 - **Gateway and OpenBao integration is not automatic.** Warpgate has its own users and targets.
 - **Warpgate does not record DB sessions.** It logs queries; replay is only for SSH, Kubernetes, RDP and VNC.
@@ -1022,7 +1039,7 @@ Goal: prove all five workstreams end to end on disposable infrastructure: a Wind
 | 1 Workstreams A, B | Runtime and migrator roles, migrations as a separate step, Docker secrets, internal networks, no published ports, TLS. | Smoke tests still pass; Laravel container cannot reach PostgreSQL; DB ports unreachable from the host. | Done 2026-11-16 (13 smoke, 38 hardening). |
 | 2 Workstream C, primaries only | OpenBao from a real config file (single-node integrated Raft storage, one Shamir key share for the lab, declarative audit device), not dev mode: dev mode loses rotated passwords and leases on restart. Keycloak realm with group `app1-devs` and two test users, one in the group, one not. Section 5 configuration. In this phase only, temp users were allowed on the primary (the no-replica fallback from 4.C). | Credentials issue; outsider denied. | Done 2026-11-16 (13 smoke, 38 hardening, 83 access checks). |
 | 3 Replicas | PostgreSQL streaming replica (`pg_basebackup` bootstrap), MariaDB replica (`server_id`, binlog, GTID), `pg_hba.conf` split, sweepers. | Replica tests in 7.4 pass. | Done 2026-11-17. Streaming replica and GTID replica over verified TLS, `pg_hba.conf` split, primaries off the access network, sweepers, stale-user report (13 smoke, 38 hardening, 83 access, 93 replica checks). |
-| 4 Workstream E | pgAudit (custom image) and `server_audit` on all servers, Fluent Bit to a volume only the log container mounts. | Audit tests in 7.4 pass. | Done 2026-11-17. pgAudit and `server_audit` on all four servers, Fluent Bit to an isolated store, lab alert rules, MariaDB binary-log password leak fixed by replica-only temp users and hash-only password statements. Revocation backstop for MariaDB: startup purge, replica-local expiry event and lease reconciler, with four new alerts (13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 81 revocation checks (85 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently)). |
+| 4 Workstream E | pgAudit (custom image) and `server_audit` on all servers, Fluent Bit to a volume only the log container mounts. | Audit tests in 7.4 pass. | Done 2026-11-17. pgAudit and `server_audit` on all four servers, Fluent Bit to an isolated store, lab alert rules, MariaDB binary-log password leak fixed by replica-only temp users and hash-only password statements. Revocation backstops: MariaDB startup purge and replica-local expiry event, a lease reconciler for both engines, and a PostgreSQL replica-side deny list (watcher inside pg-replica), with eight new alerts (13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently)). |
 | 5 Optional | Approval portal, Warpgate, break-glass role and alert. | As scoped then. | Not started. |
 
 ### 7.3 Windows notes
@@ -1035,7 +1052,7 @@ Goal: prove all five workstreams end to end on disposable infrastructure: a Wind
 
 ### 7.4 Acceptance tests
 
-Ticked items were proven in phases 0 to 4. Unticked items are not met yet.
+All items below were proven in phases 0 to 4. None is unmet.
 
 - [x] Credentials issue and work (on the primary in phase 2).
 - [x] Credentials work on the replica.
@@ -1052,7 +1069,8 @@ Ticked items were proven in phases 0 to 4. Unticked items are not met yet.
 - [x] The reconciler completes revocations queued during an outage before OpenBao's own retry, on both engines.
 - [x] An irrevocable lease is detected, alerted and revoked.
 - [x] The reconciler token is refused everything else (5.5).
-- [ ] PostgreSQL: revoke while the primary is down. Not met: the role logs in to the replica until the primary returns.
+- [x] PostgreSQL: revoke while the primary is down. The revoked role is refused on the replica within one reconciler interval plus 2 s (measured 3.8 to 12.7 s) and its open session is terminated; a replica restart during the outage gives no login window; still-valid roles keep working, except those issued in the same seconds (documented over-deny).
+- [x] Malicious deny descriptors (quotes, newlines, `all`, `+group`, `@file`, `replicator`, `bao_admin`, `postgres`, path traversal, symlink, oversized, FIFO and others) are rejected and alerted, and `pg_hba` is unchanged.
 - [x] MariaDB `SELECT ... INTO OUTFILE` and `LOAD_FILE` are denied.
 - [x] Audit entries in the database logs show the temp username. The log store joins person, lease id, username and the query on the replica, with client host.
 - [x] The OpenBao audit log maps the temp username to the person.
@@ -1063,7 +1081,17 @@ Ticked items were proven in phases 0 to 4. Unticked items are not met yet.
 ### 7.5 Known weaknesses found in the prototype
 
 - **MariaDB revocation no longer depends on the replica being reachable for logins** (three backstops, 5.4). Residual: every replica restart also drops the users of valid leases; a failed `bao lease revoke -sync` is still not retried (its user goes at the next replica start or at lease expiry).
-- **PostgreSQL primary outage (main open problem).** A role revoked while the primary is down can still log in to the replica, and keep its open session, until its `VALID UNTIL` (lease end, up to `max_ttl` 4 h). It was 10 of 10 logins during a 150 s outage. The reconciler revokes it after the primary returns (5.4).
+- **PostgreSQL primary outage (closed by the replica deny list, 5.4).** Residual risks:
+  - Detection depends on OpenBao and the reconciler. A revoked role can log in for up to one reconciler interval plus 2 s (about 62 s with the proposed 60 s interval).
+  - Roles of the same OpenBao role issued within the 4-second window are over-denied, until 60 s after the lease is gone.
+  - A role whose name was generated more than 3 s before its lease was issued would not be matched, and the scheme depends on the username template (setup refuses a different one).
+  - The descriptor volume is single-host.
+  - The watcher acts as local superuser.
+  - SIGKILL of its supervisor restarts every replica session.
+  - A compromised reconciler can deny or un-deny temp roles (no more than revoking them) but cannot inject `pg_hba` tokens (tested).
+  - The deny-applied alert waits until SQL works.
+  - The healthcheck now includes the watcher heartbeat.
+  - The image now includes tini.
 - The lease reconciler is a new credential (role ID and secret ID files; the secret ID never expires in the lab). Its token can list every database lease ID and revoke any database lease (a denial-of-access risk), and holds `sudo` on `sys/leases/lookup/database/creds/*` and `sys/leases`. Mitigated by the /32 binding. Production: a response-wrapped secret ID with TTL and use limit rotated by the orchestrator, or platform identity (Kubernetes or cert auth).
 - The reconciler cannot see a failed `-sync` revoke, because that lease is still valid.
 - Alert noise during an outage: `revocation_retried_by_reconciler` fires about every 30 s per pending lease.

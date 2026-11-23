@@ -474,17 +474,24 @@ foreach ($c in $cases) {
     [void](MaSu 'maria-replica' ($evAlter + ' DISABLE'))
     [void](New-LabMariaUser $u $pw)
     $sess = $null
-    if ($c.Expect -eq 'dropped-session-survives') { $sess = Start-MaSession $u $pw 'matrix' 30 }
+    if ($c.Expect -eq 'dropped-session-survives') {
+        $sess = Start-MaSession $u $pw 'matrix' 60
+        # Pause the maria-sweeper for this case: it ends the session of a user that no longer
+        # exists within its 10 s lab interval, which would race the check below (unpaused after it).
+        [void](Invoke-Docker @('pause', (Id 'maria-sweeper')))
+    }
     [void](MaSu 'maria-replica' ('SET SESSION sql_log_bin = 0; ' + $c.Revoke))
     $filesBefore = (Invoke-Docker @('exec', (Id 'maria-replica'), 'sh', '-c', ('ls ' + $backstopDir + ' | wc -l'))).Out.Trim()
     $since = UtcStamp 0
     [void](MaSu 'maria-replica' ($evAlter + ' ENABLE'))
     Start-Sleep -Seconds 4
     [void](MaSu 'maria-replica' ($evAlter + ' DISABLE'))
+    # The session is checked FIRST: the maria-sweeper (10 s lab interval) ends the session of a
+    # user that no longer exists, so a late check races it (seen once in an independent run).
+    $alive = $false; if ($sess) { $alive = Test-MaIdAlive $sess.Id; [void](Invoke-Docker @('unpause', (Id 'maria-sweeper'))) }
     $rows = MaRows $u
     $filesAfter = (Invoke-Docker @('exec', (Id 'maria-replica'), 'sh', '-c', ('ls ' + $backstopDir + ' | wc -l'))).Out.Trim()
     $err = @(((Invoke-Docker @('logs', '--since', $since, (Id 'maria-replica'))).All -split "`r?`n") | Where-Object { $_ -match 'Event Scheduler' -and $_ -match 'ERROR' } | Select-Object -First 1) -join ''
-    $alive = $false; if ($sess) { $alive = Test-MaIdAlive $sess.Id }
     [void](MaSu 'maria-replica' $restore)
     Drop-LabMariaUser $u
     if ($sess) { [void](MaSu 'maria-replica' ("KILL CONNECTION {0}" -f $sess.Id)) }
@@ -1034,16 +1041,16 @@ Assert-Refused 'reconciler token cannot use a cubbyhole (no default policy)' (RB
 Assert-Refused 'reconciler token cannot even look itself up (no default policy)' (RB @('token', 'lookup')) $denied
 Assert-Works 'reconciler token CAN revoke a database lease synchronously (its one write action)' (RB @('write', 'sys/leases/revoke', ('lease_id=' + $cX.Lease), 'sync=true')) 'Success'
 # AppRole binding: the same role ID and secret ID from another address on bao-reconciler.
-$rf = Join-Path $P2SecretsDir 'openbao_phase4_reconciler_role_id'
-$sf = Join-Path $P2SecretsDir 'openbao_phase4_reconciler_secret_id'
+$rf = Join-Path $P2SecretsDir ($BaoSecretPrefix + '_reconciler_role_id')
+$sf = Join-Path $P2SecretsDir ($BaoSecretPrefix + '_reconciler_secret_id')
 $x = Invoke-Docker @('run', '--rm', '--network', $netRecon, '-v', ($volCa + ':/pki-ca:ro'), '-v', ($rf + ':/s/role:ro'), '-v', ($sf + ':/s/secret:ro'), '-e', 'BAO_ADDR=https://openbao:8200', '-e', 'BAO_CACERT=/pki-ca/ca.crt',
     '--entrypoint', 'sh', 'openbao/openbao:2.7.2', '-c', 'bao write -format=json auth/approle/login role_id=@/s/role secret_id=@/s/secret > /tmp/o 2>&1; rc=$?; echo "exit=$rc client_token_lines=$(grep -c client_token /tmp/o) address=$(hostname -i)"; tr "\n" " " < /tmp/o | grep -o "Code: .*" | cut -c1-240')
 Assert-Works 'the reconciler''s role ID + secret ID are refused from any other address (CIDR binding 10.81.10.20/32), even on bao-reconciler' $x 'exit=2 client_token_lines=0 address=10\.81\.10\.\d+\s+Code: 40[03]\..*unauthorized by CIDR'
 $role = ConvertFrom-JsonOrNull (BaoRoot @('read', '-format=json', 'auth/approle/role/lease-reconciler')).Out
 Write-Result (($role.data.token_type -eq 'batch') -and ($role.data.token_no_default_policy -eq $true) -and ((@($role.data.token_policies) -join ',') -eq 'lease-reconciler') -and ((@($role.data.token_bound_cidrs) -join ',') -match '^10\.81\.10\.20(/32)?$') -and ((@($role.data.secret_id_bound_cidrs) -join ',') -eq '10.81.10.20/32') -and ($role.data.token_ttl -eq 300)) 'AppRole lease-reconciler: batch tokens of 300 s, policy lease-reconciler only, no default policy, token and secret ID bound to 10.81.10.20/32' ('token_type={0} token_ttl={1} token_policies={2} no_default={3} token_bound_cidrs={4} secret_id_bound_cidrs={5} secret_id_ttl={6} secret_id_num_uses={7}' -f $role.data.token_type, $role.data.token_ttl, (@($role.data.token_policies) -join ','), $role.data.token_no_default_policy, (@($role.data.token_bound_cidrs) -join ','), (@($role.data.secret_id_bound_cidrs) -join ','), $role.data.secret_id_ttl, $role.data.secret_id_num_uses)
 # The credentials appear in no log, no process listing, no container environment.
-$sidVal = Read-P2Secret 'openbao_phase4_reconciler_secret_id'
-$ridVal = Read-P2Secret 'openbao_phase4_reconciler_role_id'
+$sidVal = Read-P2Secret ($BaoSecretPrefix + '_reconciler_secret_id')
+$ridVal = Read-P2Secret ($BaoSecretPrefix + '_reconciler_role_id')
 $ps = (Invoke-Docker @('exec', $rc, 'ps', '-o', 'pid,args')).Out
 $envJ = (Invoke-Docker @('inspect', '-f', '{{json .Config.Env}} {{json .Config.Cmd}} {{json .Config.Entrypoint}}', $rc)).Out
 $dlog = (Invoke-Docker @('logs', $rc)).All

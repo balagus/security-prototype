@@ -104,11 +104,23 @@ foreach ($n in @(
 #   placeholder is written here, because Docker creates a DIRECTORY in place of a secret file
 #   that is missing at "docker compose up" (measured), and the reconciler starts with the stack.
 #   Existing files are kept even with -Force (the real values belong to the OpenBao instance).
-foreach ($n in @('openbao_phase4_reconciler_role_id', 'openbao_phase4_reconciler_secret_id')) {
+#   Phase 5 has its own OpenBao instance and placeholders: openbao_phase5_reconciler_*.
+foreach ($n in @('openbao_phase4_reconciler_role_id', 'openbao_phase4_reconciler_secret_id',
+                 'openbao_phase5_reconciler_role_id', 'openbao_phase5_reconciler_secret_id')) {
     $path = Join-Path $dir $n
     if (Test-Path $path) { Write-Host ('kept     secrets\{0}' -f $n); continue }
     [System.IO.File]::WriteAllText($path, 'unprovisioned', $utf8NoBom)
-    Write-Host ('written  secrets\{0} (placeholder; phase4-setup.ps1 writes the real value)' -f $n)
+    Write-Host ('written  secrets\{0} (placeholder; phase4-setup.ps1 / phase5-setup.ps1 write the real value)' -f $n)
+}
+
+# Phase 5 (compose.phase5.yaml). Earlier phases ignore these files.
+# - grafana_admin_password: Grafana's local admin, for "grafana cli" inside the container only
+#   (login form and basic auth are off; people sign in through Keycloak).
+# - keycloak_grafana_client_secret: client secret of the confidential Keycloak client "grafana".
+foreach ($n in @(
+        'grafana_admin_password',
+        'keycloak_grafana_client_secret')) {
+    Write-Secret $n { New-RandomPassword 32 }
 }
 
 # Laravel APP_KEY (AES-256-CBC needs 32 random bytes).

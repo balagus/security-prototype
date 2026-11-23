@@ -2,7 +2,12 @@
 param(
     [int]$TimeoutSeconds = 90,
     # How long to wait for the stack (migrations, Keycloak, replica clone/seed) after "up -d".
-    [int]$WaitSeconds = 420
+    [int]$WaitSeconds = 420,
+    # Phase 5 runs this script against its own stack (scripts\phase5-setup.ps1). The defaults are
+    # the phase 4 stack. The reconciler credentials are secrets\<BaoSecretPrefix>_reconciler_*.
+    [string]$ComposeFile = '',
+    [string]$Project = 'security-prototype-phase4',
+    [string]$BaoSecretPrefix = 'openbao_phase4'
 )
 
 # Phase 4 setup: takes a fresh "docker compose -f compose.phase4.yaml up -d --build" to a fully
@@ -30,9 +35,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$compose = Join-Path $root 'compose.phase4.yaml'
-$project = 'security-prototype-phase4'
-$baoPrefix = 'openbao_phase4'
+$compose = if ($ComposeFile) { (Resolve-Path $ComposeFile).Path } else { Join-Path $root 'compose.phase4.yaml' }
+$project = $Project
+$baoPrefix = $BaoSecretPrefix
+$composeName = Split-Path -Leaf $compose
 
 # Phase 4: hash-only root rotation for app1-maria from the very first rotate-root, and the role
 # app1-maria-ro is left to step 2 below (phase2-setup.ps1 does not point it at the primary).
@@ -184,7 +190,7 @@ $ev = MaVal $mR "SELECT CONCAT(EVENT_SCHEMA, '.', EVENT_NAME, ' ', STATUS, ' eve
 # The definer must be the locked least-privilege account: an ALTER EVENT without a DEFINER clause
 # silently makes the altering user (e.g. root) the definer (measured). A restart of maria-replica
 # re-creates the event from the init_file.
-if ($ev -notmatch 'ENABLED every \d+ SECOND definer revocation_backstop@localhost;') { throw ('maria-replica: expiry backstop event missing, disabled or with another definer: [' + $ev + ']. Restart maria-replica (its init_file re-creates the event) and see docker compose -f compose.phase4.yaml logs maria-replica.') }
+if ($ev -notmatch 'ENABLED every \d+ SECOND definer revocation_backstop@localhost;') { throw ('maria-replica: expiry backstop event missing, disabled or with another definer: [' + $ev + ']. Restart maria-replica (its init_file re-creates the event) and see docker compose -f ' + $composeName + ' logs maria-replica.') }
 Write-Host ('maria-replica: ' + $ev)
 $bs = Invoke-Docker @('exec', $mR, 'sh', '-c', 'ls -1t /var/log/mariadb-audit/backstop/startup-purge-*.log | head -n 1 | xargs cat')
 Write-Host ('maria-replica: last startup purge: ' + $bs.Out.Trim())
@@ -209,8 +215,8 @@ Write-Host ('auth/approle/role/lease-reconciler: policy lease-reconciler only (n
 $roleId = (Assert-Ok (Invoke-Bao @('read', '-field=role_id', 'auth/approle/role/lease-reconciler/role-id') $baoRoot) 'read role-id').Out.Trim()
 $sid = ConvertFrom-JsonOrNull (Assert-Ok (Invoke-Bao @('write', '-f', '-format=json', 'auth/approle/role/lease-reconciler/secret-id') $baoRoot) 'new secret-id').Out
 if (($null -eq $sid) -or (-not $sid.data.secret_id)) { throw 'no secret_id returned' }
-Write-P2Secret 'openbao_phase4_reconciler_role_id' $roleId
-Write-P2Secret 'openbao_phase4_reconciler_secret_id' ([string]$sid.data.secret_id)
+Write-P2Secret ($baoPrefix + '_reconciler_role_id') $roleId
+Write-P2Secret ($baoPrefix + '_reconciler_secret_id') ([string]$sid.data.secret_id)
 $newAcc = [string]$sid.data.secret_id_accessor
 $sid = $null
 $accs = ConvertFrom-JsonOrNull (Invoke-Bao @('list', '-format=json', 'auth/approle/role/lease-reconciler/secret-id') $baoRoot).Out
@@ -250,7 +256,7 @@ while ((Get-Date) -lt $deadline) {
     if ($dw.Out -match 'watchers=1 supervisors=1 ') { break }
     Start-Sleep -Seconds 2
 }
-if ($dw.Out -notmatch 'watchers=1 supervisors=1 heartbeat_age=\d+s descriptors=\d+ descriptor_dir=100:1000:755 ') { throw ('pg-replica: deny-list watcher not running or descriptor volume wrong: ' + $dw.All + '. See docker compose -f compose.phase4.yaml logs pg-replica.') }
+if ($dw.Out -notmatch 'watchers=1 supervisors=1 heartbeat_age=\d+s descriptors=\d+ descriptor_dir=100:1000:755 ') { throw ('pg-replica: deny-list watcher not running or descriptor volume wrong: ' + $dw.All + '. See docker compose -f ' + $composeName + ' logs pg-replica.') }
 $hl = Assert-Ok (Invoke-Docker @('exec', '-u', 'postgres', $pgR, 'psql', '-X', '-At', '-d', 'postgres', '-c', "SELECT 'pg_hba line ' || line_number || ': ' || array_to_string(user_name, ',') || ' ' || auth_method || coalesce(' ERROR ' || error, '') FROM pg_hba_file_rules WHERE line_number = 2")) 'pg_hba_file_rules'
 if ($hl.Out -notmatch '^pg_hba line 2: /\^\$.* reject$') { throw ('pg-replica: unexpected deny line in pg_hba: ' + $hl.Out.Trim()) }
 Write-Host ('pg-replica deny list: ' + $dw.Out.Trim() + '; ' + $hl.Out.Trim())
@@ -273,7 +279,7 @@ foreach ($s in @('maria-primary', 'maria-replica')) {
 Step 'Log shipper'
 $fb = Get-P2ContainerId 'fluent-bit'
 $st = (Invoke-Docker @('inspect', '-f', '{{.State.Status}}', $fb)).Out.Trim()
-if ($st -ne 'running') { throw ('fluent-bit is {0}. See docker compose -f compose.phase4.yaml logs fluent-bit.' -f $st) }
+if ($st -ne 'running') { throw ('fluent-bit is {0}. See docker compose -f {1} logs fluent-bit.' -f $st, $composeName) }
 $store = $project + '_log-store'
 $deadline = (Get-Date).AddSeconds(60)
 $x = $null
@@ -283,7 +289,7 @@ while ((Get-Date) -lt $deadline) {
     if ($x.Out -match 'audit\.jsonl') { break }
     Start-Sleep -Seconds 2
 }
-if ($x.Out -notmatch 'audit\.jsonl') { throw 'the log store has no audit.jsonl yet. See docker compose -f compose.phase4.yaml logs fluent-bit.' }
+if ($x.Out -notmatch 'audit\.jsonl') { throw ('the log store has no audit.jsonl yet. See docker compose -f ' + $composeName + ' logs fluent-bit.') }
 Write-Host ('fluent-bit: running; store: ' + (($x.Out.Trim() -split "`r?`n") -join '; '))
 
 Write-Host ''

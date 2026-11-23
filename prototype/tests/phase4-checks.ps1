@@ -616,7 +616,7 @@ Write-Result (($fr.Code -eq 0) -and ($fr.Out -match 'CLEAR 0\b') -and ($fr.Out -
 # CREATE/ALTER ROLE|USER statements run as postgres / root), and lab_rogue's password (set by
 # postgres and root in this run).
 $lived = @{ rogue = $rogPw }
-foreach ($fi in (Get-ChildItem (Join-Path $P2Root 'secrets') -File | Where-Object { $_.Name -match '^(pg_|maria_|keycloak_|laravel_app_key$|openbao_phase4_)' })) {
+foreach ($fi in (Get-ChildItem (Join-Path $P2Root 'secrets') -File | Where-Object { $_.Name -match '^(pg_|maria_|keycloak_|laravel_app_key$|' + [regex]::Escape($BaoSecretPrefix) + '_)' })) {
     $v = Read-P2Secret $fi.Name
     if ($v.Length -ge 12) { $lived[('secret_' + $fi.Name)] = $v }
 }

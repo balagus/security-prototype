@@ -8,3 +8,4 @@ Dockerfile  text eol=lf
 *.lua       text eol=lf
 *.json      text eol=lf
 *.tmpl      text eol=lf
+*.alloy     text eol=lf

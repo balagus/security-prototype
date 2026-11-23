@@ -490,7 +490,7 @@ $ent = ConvertFrom-JsonOrNull (BaoRoot @('read', '-format=json', ('identity/enti
 Write-Result (($null -ne $ent) -and ($ent.data.aliases[0].name -eq 'alice')) 'Audit: the entity_id in that entry resolves to the identity alias alice' ('entity {0}: name={1} alias={2} on {3}' -f $entry.auth.entity_id, $ent.data.name, $ent.data.aliases[0].name, $ent.data.aliases[0].mount_path)
 $cnt = @()
 foreach ($c in @($apg, $amr)) {
-    $x = Invoke-Docker @('exec', '-e', 'P2P', $ids['openbao'], 'sh', '-c', 'test -s /openbao/logs/audit.log && grep -cF "$P2P" /openbao/logs/audit.log; true') @{ P2P = $c.Password }
+    $x = Invoke-Docker @('exec', '-e', 'P2P', $ids['openbao'], 'sh', '-c', 'test -s /openbao/logs/audit.log && grep -cF -- "$P2P" /openbao/logs/audit.log; true') @{ P2P = $c.Password }
     $cnt += $x.Out.Trim()
 }
 $sz = (Invoke-Docker @('exec', $ids['openbao'], 'sh', '-c', 'wc -l < /openbao/logs/audit.log')).Out.Trim()
