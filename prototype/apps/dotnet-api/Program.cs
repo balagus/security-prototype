@@ -1,6 +1,10 @@
 using DotnetApi;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
+using Npgsql;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -70,6 +74,36 @@ builder.Services.AddDbContext<AppDbContext>(o => Configure(o, appCs));
 builder.Services.ConfigureHttpJsonOptions(o =>
     o.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower);
 
+// Phase 5: debug telemetry over OTLP, only when OTEL_EXPORTER_OTLP_ENDPOINT is set (phases 0 to 4
+// leave it unset and send nothing; migrate mode above never gets here). The exporter, service
+// name and resource attributes come from the standard OTEL_* environment variables.
+// No PII: no request bodies, no query strings (url.query removed), SQL text is EF Core's
+// parameterized command (Npgsql records no parameter values), handlers log no customer fields.
+// Alloy redacts again before anything is stored (config/telemetry/alloy/config.alloy).
+if (!string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]))
+{
+    var otel = builder.Services.AddOpenTelemetry()
+        .WithTracing(t => t
+            .AddAspNetCoreInstrumentation(o =>
+            {
+                o.RecordException = true;
+                o.Filter = ctx => !ctx.Request.Path.StartsWithSegments("/health");
+                o.EnrichWithHttpRequest = (activity, _) => activity.SetTag("url.query", null);
+            })
+            .AddNpgsql()
+            .AddOtlpExporter())
+        .WithLogging(l => l.AddOtlpExporter(), o =>
+        {
+            o.IncludeFormattedMessage = true;
+            o.IncludeScopes = false;
+        });
+
+    if (!string.Equals(builder.Configuration["OTEL_METRICS_EXPORTER"], "none", StringComparison.OrdinalIgnoreCase))
+    {
+        otel.WithMetrics(m => m.AddAspNetCoreInstrumentation().AddOtlpExporter());
+    }
+}
+
 var app = builder.Build();
 
 if (string.Equals(builder.Configuration["RUN_MIGRATIONS_ON_STARTUP"], "true", StringComparison.OrdinalIgnoreCase))
@@ -98,27 +132,38 @@ app.MapGet("/health", async (AppDbContext db, CancellationToken ct) =>
     }
 });
 
-app.MapGet("/api/customers", async (AppDbContext db, CancellationToken ct) =>
-    Results.Ok(await db.Customers.AsNoTracking().OrderBy(c => c.Id).ToListAsync(ct)));
+// Log lines carry only counts and ids, never customer fields (they go to the debug telemetry).
+app.MapGet("/api/customers", async (AppDbContext db, ILogger<Program> log, CancellationToken ct) =>
+{
+    var list = await db.Customers.AsNoTracking().OrderBy(c => c.Id).ToListAsync(ct);
+    log.LogInformation("Listed {Count} customers", list.Count);
+    return Results.Ok(list);
+});
 
-app.MapPost("/api/customers", async (CustomerCreate? body, AppDbContext db, CancellationToken ct) =>
+app.MapPost("/api/customers", async (CustomerCreate? body, AppDbContext db, ILogger<Program> log, CancellationToken ct) =>
 {
     var email = body?.Email?.Trim();
     var fullName = body?.FullName?.Trim();
     if (string.IsNullOrEmpty(email) || string.IsNullOrEmpty(fullName)
         || email.Length > 255 || fullName.Length > 255)
     {
+        log.LogWarning("Customer create rejected: validation failed");
         return Results.Json(new { error = "email and full_name are required (max 255 chars)" }, statusCode: 400);
     }
 
     var c = new Customer { Email = email, FullName = fullName };
     db.Customers.Add(c);
     await db.SaveChangesAsync(ct);
+    log.LogInformation("Created customer {CustomerId}", c.Id);
     return Results.Created($"/api/customers/{c.Id}", c);
 });
 
-app.MapGet("/api/orders", async (AppDbContext db, CancellationToken ct) =>
-    Results.Ok(await db.Orders.AsNoTracking().OrderBy(o => o.Id).ToListAsync(ct)));
+app.MapGet("/api/orders", async (AppDbContext db, ILogger<Program> log, CancellationToken ct) =>
+{
+    var list = await db.Orders.AsNoTracking().OrderBy(o => o.Id).ToListAsync(ct);
+    log.LogInformation("Listed {Count} orders", list.Count);
+    return Results.Ok(list);
+});
 
 await app.RunAsync();
 return 0;

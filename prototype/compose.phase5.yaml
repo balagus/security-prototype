@@ -1,0 +1,1458 @@
+# Phase 5: phase 4 plus debug telemetry (design principle 1, "remove the need first"): traces
+# and logs from the browser and both APIs, so bugs are reproduced from telemetry instead of
+# from just-in-time database access. Standalone file: everything from compose.phase4.yaml is
+# repeated here with its own project name and volumes. Stop phase 4 before starting this (host
+# port 8080, the same subnets, memory).
+#
+# Before first start:  powershell -ExecutionPolicy Bypass -File .\scripts\gen-secrets.ps1
+# After "up -d":       powershell -ExecutionPolicy Bypass -File .\scripts\phase5-setup.ps1
+# No password, connection string, token or key appears in this file. (The Faro API key below
+# is not a secret: it ships inside the browser bundle and only filters noise.)
+#
+# What phase 5 adds (marked "Phase 5" below). Configs in config/telemetry/, adapted from the
+# balagus/telemetries repository (commit 91f6f8d):
+#   - alloy (Grafana Alloy, Apache-2.0): the only telemetry entry point. OTLP from dotnet-api and
+#     laravel-api, Faro from the browser through nginx (/faro/ -> alloy:12347, same origin, so
+#     Alloy publishes no port). A redaction stage masks e-mail addresses and deletes query
+#     strings, request bodies and SQL parameter values BEFORE anything is stored.
+#   - loki (logs) and tempo (traces), AGPL-3.0, single binary, filesystem storage, short lab
+#     retention (7 days / 72 hours). No MinIO, no Mimir (no metrics backend: memory budget).
+#   - grafana (AGPL-3.0) on 127.0.0.1:3000, the only new published port. Sign-in through the
+#     Keycloak realm only (client "grafana", config/keycloak/phase5/lab-realm.json): group
+#     app1-devs -> Viewer, everyone else refused; no login form, no basic auth, no anonymous.
+#   - telemetry-init (one-shot, no network) sets the owners of the three telemetry volumes.
+#   - Networks: telemetry (internal: alloy and the apps that send to it) and telemetry-store
+#     (internal: alloy, loki, tempo, grafana). The apps cannot reach the stores.
+#   - Telemetry is NOT the audit trail. fluent-bit, log-store and every audit volume are exactly
+#     as in phase 4; no telemetry container mounts any of them (tests\phase5-checks.ps1).
+#   - The app images read OTEL_* settings; without them (phases 0 to 4) they send nothing.
+#
+# Phase 4 description (unchanged in this file):
+# Phase 4: phase 3 plus database audit logging and log shipping (design section 4.E,
+# workstream E).
+#
+# What phase 4 adds (marked "Phase 4" below):
+#   - pg-primary and pg-replica run a small image FROM postgres:17 with pgAudit
+#     (images/postgres-pgaudit), log in PostgreSQL's own JSON format (jsonlog) to files on their
+#     own volumes, and log connections and disconnections.
+#   - maria-primary and maria-replica load the bundled server_audit plugin
+#     (FORCE_PLUS_PERMANENT) and write its file to their own volumes.
+#   - OpenBao writes its audit file (mode 0640) to the bao-audit volume, and the sweepers tee
+#     their stdout to a file on their own volumes.
+#   - fluent-bit reads all of those volumes READ-ONLY, normalizes every record to one JSON line
+#     and writes audit.jsonl and alerts.jsonl to the log-store volume. It has no network at all,
+#     runs as a non-root uid, and is the ONLY container that mounts log-store.
+#   - log-init (one-shot, no network) sets ownership and modes of the log volumes.
+#   - MariaDB clear-text password fix (design 4.E): OpenBao creates the MariaDB temp users on
+#     maria-replica ONLY (account bao_replica_admin, local to the replica, network bao-replica,
+#     sessions with sql_log_bin = 0), so they are in no binary log and never exist on the
+#     primary; the replica keeps its own binlog (log_slave_updates); the primary's passwords
+#     are set with SET PASSWORD FOR (config/mariadb/phase4/, hash only in the binlog); the
+#     replica's seed load is not audited (config/mariadb/phase4/20-replica-seed.sh).
+#   - Revocation backstops (design 5.4, "Revocation depends on the replica being reachable"):
+#     maria-replica drops every local v- user at each start before it accepts connections
+#     (init_file) and runs a local event that drops v- users older than max_ttl + margin;
+#     lease-reconciler retries pending and irrevocable OpenBao revocations. All three log to files
+#     that fluent-bit ships, with alert rules.
+#   - PostgreSQL replica deny list (design 5.4, the primary-outage gap): for each pending or
+#     irrevocable app1-pg-ro lease, lease-reconciler writes a descriptor into the volume pg-deny
+#     (read-write there, read-only in pg-replica, mounted nowhere else); pg-replica's watcher
+#     (config/postgres/pg-deny-watcher.sh, as postgres, under "tini -s", started by its entrypoint;
+#     the server stays PID 1) validates it, writes a /^v-...$ pattern into the pg_hba include file
+#     /var/lib/postgresql/pg-deny/denied_roles (line 2 of pg_hba_replica, a reject before every
+#     allow line), reloads, terminates the role's sessions and logs to pg-replica-log/pg-deny/.
+#
+# Fixed addresses (pg_hba.conf, MariaDB host masks and the tests depend on them):
+#   bao-admin   10.81.4.0/24  openbao .10
+#   access      10.81.5.0/24  pg-replica .11, maria-replica .12, pg-sweeper .21, maria-sweeper .22
+#   pg-repl     10.81.7.0/24  pg-primary .10, pg-replica .11
+#   maria-repl  10.81.8.0/24  maria-primary .10, maria-replica .11
+#   bao-replica 10.81.9.0/24  openbao .10, maria-replica .12 (alias maria-replica-admin)
+#   bao-reconciler 10.81.10.0/24  openbao .10, lease-reconciler .20
+#   (pg-deny is a volume, not a network: lease-reconciler and pg-replica share no network)
+#   Phase 5:
+#   telemetry       10.81.11.0/24  alloy .10, dotnet-api .20, laravel-api .21, web .22
+#   telemetry-store 10.81.12.0/24  alloy .10, loki .11, tempo .12, grafana .13
+#
+# Log ownership (config/logs/log-init.sh): each source directory belongs to its writer's uid
+# with group 4000 (setgid, 2750); fluent-bit runs as 4001:4000. Nothing else is in group 4000.
+name: security-prototype-phase5
+
+# Phase 5: Faro API key, shared by the web build and alloy. NOT a secret (it is in the browser
+# bundle); it only makes alloy drop payloads that do not come from this app.
+x-faro-api-key: &faro_api_key "lab-faro-app1-web"
+
+services:
+  # One-shot lab PKI: CA + server certificates (also for both replicas) into named volumes.
+  pki-init:
+    image: postgres:17          # reused only for its openssl binary; no server is started
+    entrypoint: ["sh", "/pki-init.sh"]
+    user: "0:0"
+    network_mode: none
+    mem_limit: 64m
+    security_opt: ["no-new-privileges:true"]
+    configs:
+      - source: pki_init
+        target: /pki-init.sh
+    volumes:
+      - pki-ca-key:/pki-ca-key
+      - pki-ca:/pki-ca
+      - pki-pg:/pki-pg
+      - pki-maria:/pki-maria
+      - pki-bao:/pki-bao
+      - pki-pg-replica:/pki-pg-replica
+      - pki-maria-replica:/pki-maria-replica
+
+  # Phase 4: one-shot, sets owner/group/mode of the log volumes (see log-init.sh). Root, no
+  # network; reuses postgres:17 for its shell only.
+  log-init:
+    image: postgres:17
+    entrypoint: ["sh", "/log-init.sh"]
+    user: "0:0"
+    network_mode: none
+    mem_limit: 32m
+    security_opt: ["no-new-privileges:true"]
+    configs:
+      - source: log_init
+        target: /log-init.sh
+    volumes:
+      - pg-primary-log:/v/pg-primary-log
+      - pg-replica-log:/v/pg-replica-log
+      - maria-primary-audit:/v/maria-primary-audit
+      - maria-replica-audit:/v/maria-replica-audit
+      - pg-sweeper-log:/v/pg-sweeper-log
+      - maria-sweeper-log:/v/maria-sweeper-log
+      - bao-audit:/v/bao-audit
+      - reconciler-log:/v/reconciler-log
+      # Not a log volume: the PostgreSQL deny-list descriptors (owner: the reconciler's uid).
+      - pg-deny:/v/pg-deny
+      - log-store:/v/log-store
+      - fluent-bit-state:/v/fluent-bit-state
+
+  pg-primary:
+    # Phase 4: postgres:17 + pgAudit from PGDG (images/postgres-pgaudit/Dockerfile).
+    build: ./images/postgres-pgaudit
+    image: security-prototype-phase5-postgres-pgaudit
+    mem_limit: 512m
+    security_opt: ["no-new-privileges:true"]
+    command:
+      - postgres
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/pki/server.crt
+      - -c
+      - ssl_key_file=/pki/server.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - password_encryption=scram-sha-256
+      # Phase 3: streaming replication (wal_level=replica and max_wal_senders=10 are the
+      # defaults). The replica uses the physical slot pg_replica, so WAL it still needs is kept
+      # while it is stopped; the cap stops a dead replica from filling the primary's disk.
+      - -c
+      - max_slot_wal_keep_size=1GB
+      # ---- Phase 4: logging and pgAudit (identical on pg-replica except pgaudit.log) ----
+      # Settings given here on the command line outrank postgresql.conf AND
+      # postgresql.auto.conf, so ALTER SYSTEM cannot change them (role, database and session
+      # settings still can; see the README).
+      - -c
+      - shared_preload_libraries=pgaudit
+      # File logging in PostgreSQL's own JSON format (one object per line, every field named:
+      # timestamp, user, dbname, pid, remote_host, session_id, error_severity, state_code,
+      # message, statement, application_name, ...). jsonlog needs the logging collector.
+      - -c
+      - logging_collector=on
+      - -c
+      - log_destination=jsonlog
+      - -c
+      - log_directory=/var/log/pgaudit
+      - -c
+      - log_filename=postgresql-%Y-%m-%d_%H%M%S.log
+      # Group-readable for the shipper (the directory's group is 4000, setgid).
+      - -c
+      - log_file_mode=0640
+      - -c
+      - log_rotation_age=1d
+      - -c
+      - log_rotation_size=10MB
+      - -c
+      - log_timezone=UTC
+      # Only used for text (stderr) output: what still reaches "docker logs" before the
+      # collector starts. jsonlog records carry these fields natively.
+      - -c
+      - "log_line_prefix=%m [%p] user=%u db=%d host=%h app=%a "
+      # Every login (and failed login) with user, database, client address; every session end
+      # with its duration.
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      # No core statement logging: pgAudit decides what is logged. The default
+      # log_min_error_statement=error still logs the statement of every failed statement
+      # (permission denied, read-only) with user and host.
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=error
+      # Primary: DDL (migrations) and ROLE (CREATE/ALTER/DROP ROLE, GRANT/REVOKE: what
+      # bao_admin does for every lease). Not READ/WRITE: the application's own queries would
+      # dominate the volume and developers cannot connect to the primary at all.
+      # pgAudit writes bao_admin's CREATE ROLE ... PASSWORD as "PASSWORD <REDACTED>". Core
+      # statement logging (log_statement, and the STATEMENT of a failed statement) would write
+      # it verbatim; OpenBao's password_authentication=scram-sha-256 (phase2-setup.ps1) makes
+      # that a SCRAM verifier instead of the password. tests/phase4-checks.ps1 shows both.
+      - -c
+      - pgaudit.log=ddl, role
+      - -c
+      - pgaudit.log_catalog=on
+      - -c
+      - pgaudit.log_relation=off
+      - -c
+      - pgaudit.log_parameter=off
+      - -c
+      - pgaudit.log_statement_once=off
+      - -c
+      - pgaudit.log_level=log
+    environment:
+      POSTGRES_DB: app1
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_superuser_password
+    secrets:
+      - pg_superuser_password
+      - pg_app1_migrator_password
+      - pg_app1_runtime_password
+      - pg_bao_admin_initial_password
+      # Phase 3: replicator (first init, 20-replication.sh) and the sweeper account
+      # (/opt/phase3/access-setup.sh, run by phase3-setup.ps1; replicates to the replica).
+      - pg_replicator_password
+      - pg_session_sweeper_password
+    configs:
+      - source: pg_hba_primary
+        target: /etc/postgresql/pg_hba.conf
+      # Phase 4: per-role pgAudit settings, first (05) so the passwords set by 10 and 20 are
+      # never audited; run again by phase4-setup.ps1.
+      - source: pg_phase4_audit_roles
+        target: /docker-entrypoint-initdb.d/05-pgaudit-roles.sh
+      - source: pg_init_roles
+        target: /docker-entrypoint-initdb.d/10-app1-roles.sh
+      - source: pg_init_replication
+        target: /docker-entrypoint-initdb.d/20-replication.sh
+      - source: pg_phase2_access_setup
+        target: /opt/phase2/access-setup.sh
+      - source: pg_phase3_access_setup
+        target: /opt/phase3/access-setup.sh
+      - source: pg_phase4_audit_roles
+        target: /opt/phase4/audit-roles.sh
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - pki-pg:/pki:ro
+      # Phase 4: log files (jsonlog). Read-only in fluent-bit.
+      - pg-primary-log:/var/log/pgaudit
+    networks:
+      app1-pg: {}
+      # OpenBao connects here as bao_admin (never through "access").
+      bao-admin: {}
+      pg-repl:
+        ipv4_address: 10.81.7.10
+      # Phase 3: NOT on "access" (the PHASE2-FALLBACK attachment is gone).
+    healthcheck:
+      # Phase 4: application_name marks the healthcheck's own superuser login in the log, so
+      # the shipper's superuser alert can leave it out (local socket only).
+      test: ["CMD-SHELL", "gosu postgres pg_isready -d 'dbname=app1 user=postgres application_name=pg-healthcheck'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+      log-init:
+        condition: service_completed_successfully
+
+  # Phase 3: hot standby, physical streaming replication from pg-primary over verified TLS.
+  # First start: replica-entrypoint.sh clones the primary with pg_basebackup; later starts
+  # skip that (marker file), so a restart resumes streaming from where it stopped.
+  pg-replica:
+    build: ./images/postgres-pgaudit
+    image: security-prototype-phase5-postgres-pgaudit
+    mem_limit: 384m
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["bash", "/opt/replica/replica-entrypoint.sh"]
+    command:
+      - postgres
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/pki/server.crt
+      - -c
+      - ssl_key_file=/pki/server.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - hot_standby=on
+      # No password here: libpq reads it from the passfile, which the entrypoint builds from
+      # the Docker secret at every start.
+      - -c
+      - primary_conninfo=host=pg-primary port=5432 user=replicator application_name=pg-replica sslmode=verify-full sslrootcert=/pki-ca/ca.crt passfile=/var/run/postgresql/replica/pgpass
+      - -c
+      - primary_slot_name=pg_replica
+      # A replica query that blocks WAL replay is cancelled after 30 s of replay delay, so the
+      # replica (and with it new credentials and revocations) never falls further behind than
+      # that because of a developer query. Set explicitly; 30 s is also the default.
+      - -c
+      - max_standby_streaming_delay=30s
+      # Off on purpose: with feedback on, a long developer query on the replica holds back
+      # VACUUM on the PRIMARY (bloat, wraparound pressure), so a read-only developer could
+      # degrade production. Off means such a query is cancelled instead (see above).
+      - -c
+      - hot_standby_feedback=off
+      # ---- Phase 4: logging and pgAudit (see pg-primary for the comments) ----
+      - -c
+      - shared_preload_libraries=pgaudit
+      - -c
+      - logging_collector=on
+      - -c
+      - log_destination=jsonlog
+      - -c
+      - log_directory=/var/log/pgaudit
+      - -c
+      - log_filename=postgresql-%Y-%m-%d_%H%M%S.log
+      - -c
+      - log_file_mode=0640
+      - -c
+      - log_rotation_age=1d
+      - -c
+      - log_rotation_size=10MB
+      - -c
+      - log_timezone=UTC
+      - -c
+      - "log_line_prefix=%m [%p] user=%u db=%d host=%h app=%a "
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=error
+      # Replica: developers' queries land here. Every READ (the masked-view SELECTs), plus
+      # WRITE/DDL/ROLE (all refused by the standby; the refusal itself is logged as an ERROR
+      # with the statement) and MISC_SET (SET statement_timeout = 0 and the like). Catalog
+      # queries are logged too (log_catalog on) for every role without a role setting, i.e.
+      # for every temp user; postgres and session_sweeper have log_catalog off as a role
+      # setting (config/postgres/phase4-audit-roles.sh).
+      - -c
+      - pgaudit.log=read, write, ddl, role, misc_set
+      - -c
+      - pgaudit.log_catalog=on
+      - -c
+      - pgaudit.log_relation=off
+      - -c
+      - pgaudit.log_parameter=off
+      - -c
+      - pgaudit.log_statement_once=off
+      - -c
+      - pgaudit.log_level=log
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      # ---- Phase 4: replica-side deny list (config/postgres/pg-deny-watcher.sh) ----
+      # OpenBao roles whose descriptors are accepted (exact names; must match the reconciler's
+      # PG_DENY_ROLES). Anything else in /pg-deny is rejected and alerted.
+      PG_DENY_ALLOWED_ROLES: "app1-pg-ro"
+      # Must match the username_template: (.RoleName | truncate 12), see scripts/phase2-setup.ps1.
+      PG_DENY_ROLE_TRUNCATE: "12"
+      # Username timestamps accepted per descriptor: issue_time - 3 s .. issue_time (measured gap
+      # 0 to 1 s; the name is generated before the lease is created).
+      PG_DENY_TS_WINDOW_SECONDS: "3"
+      PG_DENY_INTERVAL_SECONDS: "2"
+      # A deny whose descriptor is gone but whose pattern still matches a role is kept this long
+      # (and only while streaming), so the DROP ROLE has replicated before it is lifted.
+      PG_DENY_RELEASE_GRACE_SECONDS: "60"
+    secrets:
+      - pg_replicator_password
+    configs:
+      - source: pg_replica_entrypoint
+        target: /opt/replica/replica-entrypoint.sh
+      - source: pg_hba_replica
+        target: /etc/postgresql/pg_hba.conf
+      # Phase 4: deny-list watcher, started by replica-entrypoint.sh (as postgres, under tini -s).
+      - source: pg_deny_watcher
+        target: /opt/replica/pg-deny-watcher.sh
+    volumes:
+      - pg-replica-data:/var/lib/postgresql/data
+      - pki-pg-replica:/pki:ro
+      # Verifies pg-primary's certificate (verify-full) for pg_basebackup and streaming.
+      - pki-ca:/pki-ca:ro
+      # Phase 4: log files (jsonlog). Read-only in fluent-bit.
+      - pg-replica-log:/var/log/pgaudit
+      # Phase 4: deny-list descriptors, written by lease-reconciler. READ-ONLY here. The pg_hba
+      # include file the watcher builds from them is NOT on this volume
+      # (/var/lib/postgresql/pg-deny/denied_roles, container file system, owner postgres, 0600).
+      - pg-deny:/pg-deny:ro
+    networks:
+      pg-repl:
+        ipv4_address: 10.81.7.11
+      access:
+        ipv4_address: 10.81.5.11
+    healthcheck:
+      # Phase 4: also unhealthy when the deny-list watcher has not completed a pass for 30 s.
+      test: ["CMD-SHELL", "gosu postgres psql -XAtq 'dbname=postgres application_name=pg-healthcheck' -c \"SELECT status FROM pg_stat_wal_receiver\" | grep -qx streaming && test $$(( $$(date +%s) - $$(stat -c %Y /var/lib/postgresql/pg-deny/heartbeat) )) -lt 30"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+      log-init:
+        condition: service_completed_successfully
+      pg-primary:
+        condition: service_healthy
+
+  maria-primary:
+    image: mariadb:11.8
+    mem_limit: 512m
+    security_opt: ["no-new-privileges:true"]
+    command:
+      - mariadbd
+      - --ssl-cert=/pki/server.crt
+      - --ssl-key=/pki/server.key
+      - --require-secure-transport=ON
+      - --tls-version=TLSv1.2,TLSv1.3
+      # Phase 3: binary log with GTIDs for the replica.
+      - --server-id=1
+      - --log-bin=mariadb-bin
+      - --binlog-format=ROW
+      - --gtid-strict-mode=ON
+      - --binlog-expire-logs-seconds=604800
+      # ---- Phase 4: server_audit (bundled plugin, GPL-2.0) ----
+      # FORCE_PLUS_PERMANENT: the server refuses to start without the plugin, and
+      # UNINSTALL PLUGIN fails. (root can still SET GLOBAL server_audit_logging = OFF.)
+      - --plugin-load-add=server_audit
+      - --server-audit=FORCE_PLUS_PERMANENT
+      - --server-audit-logging=ON
+      - --server-audit-output-type=file
+      - --server-audit-file-path=/var/log/mariadb-audit/server_audit.log
+      - --server-audit-file-rotate-size=10485760
+      - --server-audit-file-rotations=9
+      # Primary: every connection (login and failed login, for the allowlist alert; CONNECT
+      # events are written for excluded users too) and every statement of every account except
+      # the two below. Not QUERY_DDL,QUERY_DCL: measured, those classes do NOT include
+      # ALTER USER or SET PASSWORD, so OpenBao's root rotation would go unaudited. Excluded: app1_runtime (the application's own queries would dominate the
+      # volume; developers cannot connect to the primary) and the image's local healthcheck
+      # account (every 5 s).
+      - --server-audit-events=CONNECT,QUERY
+      - --server-audit-excl-users=healthcheck,app1_runtime
+      - --server-audit-query-log-limit=4096
+      # Explicitly off: the general log and the slow log would hold every statement verbatim.
+      - --general-log=OFF
+      - --slow-query-log=OFF
+    environment:
+      MARIADB_DATABASE: app1
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/maria_root_password
+      MARIADB_ROOT_HOST: localhost
+      APP1_MARIA_HOSTMASK: 10.81.3.0/255.255.255.0
+      BAO_ADMIN_HOST: 10.81.4.10
+      # Phase 3: replicator exists only for the replica's fixed maria-repl address (first init),
+      # session_sweeper only for the sweeper's fixed access address (phase3 access setup).
+      REPLICA_HOST: 10.81.8.11
+      SWEEPER_HOST: 10.81.5.22
+    secrets:
+      - maria_root_password
+      - maria_app1_migrator_password
+      - maria_app1_runtime_password
+      - maria_bao_admin_initial_password
+      - maria_replicator_password
+      - maria_session_sweeper_password
+    # Phase 4: variants of the four scripts that set MariaDB passwords on the primary
+    # (config/mariadb/phase4/). They set every password with SET PASSWORD FOR on a locked
+    # account, which the binary log records as the hash; the originals' IDENTIFIED BY '<pw>'
+    # is binlogged in clear text. Same target paths, so the setup scripts are unchanged.
+    configs:
+      - source: maria_phase4_init_users
+        target: /docker-entrypoint-initdb.d/10-app1-users.sh
+      - source: maria_phase4_init_replication
+        target: /docker-entrypoint-initdb.d/20-replication.sh
+      - source: maria_phase4_phase2_access_setup
+        target: /opt/phase2/access-setup.sh
+      - source: maria_phase4_phase3_access_setup
+        target: /opt/phase3/access-setup.sh
+    volumes:
+      - maria-data:/var/lib/mysql
+      - pki-maria:/pki:ro
+      # Phase 4: server_audit file. Read-only in fluent-bit.
+      - maria-primary-audit:/var/log/mariadb-audit
+    networks:
+      app1-maria: {}
+      bao-admin: {}
+      maria-repl:
+        ipv4_address: 10.81.8.10
+      # Phase 3: NOT on "access".
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+      log-init:
+        condition: service_completed_successfully
+
+  # Phase 3: GTID replica of maria-primary, read_only. First start (empty volume): the init
+  # script 20-replica-seed.sh takes a consistent dump of the primary INCLUDING the mysql system
+  # database (so existing accounts exist), loads it and starts replication at the dump's GTID.
+  # replica-entrypoint.sh wipes a half-seeded data directory before the image entrypoint runs.
+  maria-replica:
+    image: mariadb:11.8
+    mem_limit: 384m
+    security_opt: ["no-new-privileges:true"]
+    # Phase 4: renders the init_file (startup purge + expiry backstop event) and creates the
+    # backstop log directory, then runs the phase 3 entrypoint (replica-entrypoint.sh).
+    entrypoint: ["bash", "/opt/replica/phase4-entrypoint.sh"]
+    command:
+      - mariadbd
+      - --ssl-cert=/pki/server.crt
+      - --ssl-key=/pki/server.key
+      - --require-secure-transport=ON
+      - --tls-version=TLSv1.2,TLSv1.3
+      - --server-id=2
+      - --read-only=ON
+      - --gtid-strict-mode=ON
+      - --relay-log=maria-replica-relay
+      # Phase 4: the replica keeps its own binary log of everything it applies
+      # (log_slave_updates), as a failover candidate or a PITR source would. OpenBao's local
+      # statements (temp users, its own account) must stay OUT of it: they run with
+      # sql_log_bin=0 (see phase4-setup.ps1). A local statement that reached this binlog would
+      # get a GTID 0-2-n, which gtid_strict_mode turns into a replication stop or a broken
+      # failover later. tests\phase4-checks.ps1 searches this binlog too.
+      - --log-bin=maria-replica-bin
+      - --log-slave-updates=ON
+      - --binlog-format=ROW
+      - --binlog-expire-logs-seconds=604800
+      # Smaller than the default 128M: the replica gets 384m.
+      - --innodb-buffer-pool-size=64M
+      # ---- Phase 4: server_audit (see maria-primary) ----
+      - --plugin-load-add=server_audit
+      - --server-audit=FORCE_PLUS_PERMANENT
+      - --server-audit-logging=ON
+      - --server-audit-output-type=file
+      - --server-audit-file-path=/var/log/mariadb-audit/server_audit.log
+      - --server-audit-file-rotate-size=10485760
+      - --server-audit-file-rotations=9
+      # Replica: developers' queries land here. Every connection and every statement of
+      # every account except the two listed below (server_audit_incl_users has no wildcard,
+      # so "v-*" cannot be included by name; excluding the known noisy accounts keeps every
+      # temp user, root and any unknown account audited).
+      - --server-audit-events=CONNECT,QUERY
+      # healthcheck: every 5 s; session_sweeper: every sweep interval (its kills are in its
+      # own log).
+      - --server-audit-excl-users=healthcheck,session_sweeper
+      - --server-audit-query-log-limit=4096
+      - --general-log=OFF
+      - --slow-query-log=OFF
+      # ---- Phase 4: revocation backstops (config/mariadb/phase4/replica-init.sql.tmpl) ----
+      # Runs at EVERY start, before the network listener opens: drops every local v- user
+      # (startup purge) and (re)creates the expiry backstop event and its locked definer.
+      # Rendered by phase4-entrypoint.sh from the BACKSTOP_* variables below.
+      - --init-file=/etc/mysql/replica-init/init.sql
+      # The expiry backstop is an event (replica_local.revocation_backstop). Events that arrive
+      # from the primary are created SLAVESIDE_DISABLED and do not run here.
+      - --event-scheduler=ON
+      # The purge and the event write their log lines with SELECT ... INTO OUTFILE; FILE is
+      # limited to this directory (it was unrestricted before: root could read and write any file
+      # the server can).
+      - --secure-file-priv=/var/log/mariadb-audit/backstop
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/maria_root_password
+      MARIADB_ROOT_HOST: localhost
+      MARIADB_PRIMARY_HOST: maria-primary
+      # Phase 4: host of OpenBao's local replica account bao_replica_admin (OpenBao on bao-replica).
+      BAO_REPLICA_ADMIN_HOST: 10.81.9.10
+      # Phase 4: expiry backstop. BACKSTOP_MAX_TTL_SECONDS must equal the max_ttl of the OpenBao
+      # role app1-maria-ro (4h; tests\revocation-checks.ps1 compares them). The lab runs the event
+      # every 15 s; production: every 300 s with a margin of 900 s.
+      BACKSTOP_INTERVAL_SECONDS: "15"
+      BACKSTOP_MAX_TTL_SECONDS: "14400"
+      BACKSTOP_MARGIN_SECONDS: "300"
+    secrets:
+      - maria_root_password
+      - maria_replicator_password
+    configs:
+      - source: maria_replica_entrypoint
+        target: /opt/replica/replica-entrypoint.sh
+      # Phase 4: wrapper entrypoint and the init_file template (revocation backstops).
+      - source: maria_phase4_replica_entrypoint
+        target: /opt/replica/phase4-entrypoint.sh
+      - source: maria_phase4_replica_init
+        target: /opt/replica/replica-init.sql.tmpl
+      # Phase 4 variant of the seed: the dump load runs with sql_log_bin = 0 (the replica now
+      # has a binary log) and with server_audit_logging OFF (the dump inserts every account's
+      # password hash into mysql.global_priv).
+      - source: maria_phase4_replica_seed
+        target: /docker-entrypoint-initdb.d/20-replica-seed.sh
+      # Phase 4: OpenBao's local account on the replica (run by phase4-setup.ps1).
+      - source: maria_phase4_replica_bao_account
+        target: /opt/phase4/replica-bao-account.sh
+    volumes:
+      - maria-replica-data:/var/lib/mysql
+      - pki-maria-replica:/pki:ro
+      # Verifies maria-primary's certificate (seed dump and replication connection).
+      - pki-ca:/pki-ca:ro
+      # Phase 4: server_audit file. Read-only in fluent-bit.
+      - maria-replica-audit:/var/log/mariadb-audit
+    networks:
+      maria-repl:
+        ipv4_address: 10.81.8.11
+      access:
+        ipv4_address: 10.81.5.12
+      # Phase 4 (temp users on the replica): OpenBao's admin path to the replica, a network of
+      # its own with only OpenBao (.10) and this replica (.12). The alias exists ONLY on this
+      # network, so OpenBao (also on "access") always reaches the replica from 10.81.9.10, the
+      # only host bao_replica_admin may log in from. The certificate name stays maria-replica
+      # (OpenBao's tls_server_name).
+      # NOT bao-admin, measured: on bao-admin the name maria-primary resolved to the primary's
+      # bao-admin address, the replication IO thread connected from 10.81.4.12 and the primary
+      # refused it (replicator exists only for 10.81.8.11), so replication stopped. It would also
+      # give this developer-facing server a route to both primaries' admin interfaces, and let
+      # OpenBao log in here as the replicated bao_admin@10.81.4.10.
+      bao-replica:
+        ipv4_address: 10.81.9.12
+        aliases:
+          - maria-replica-admin
+    healthcheck:
+      # The replica's own healthcheck account gets REPLICA MONITOR in 20-replica-seed.sh.
+      # The replication_* options are settings for the --replication test that follows them.
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized", "--replication_io", "--replication_sql", "--replication"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+      log-init:
+        condition: service_completed_successfully
+      maria-primary:
+        condition: service_healthy
+
+  # Phase 3: replica session sweepers (design 5.4). Small loops that reuse the database images
+  # for their client tools; each logs one line per session it ends.
+  # SWEEP_INTERVAL_SECONDS: 10 in the lab; the proposal says 60 for production.
+  # Phase 4: stdout is also appended to a file on the sweeper's own log volume (tee), so the
+  # shipper can read it without access to the Docker daemon. "docker logs" is unchanged.
+  pg-sweeper:
+    image: postgres:17
+    entrypoint: ["bash", "-c", "set -o pipefail; bash /opt/sweeper/pg-sweeper.sh 2>&1 | tee -a /var/log/sweeper/pg-sweeper.log"]
+    user: "999:999"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m,mode=1777
+    mem_limit: 64m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      SWEEP_INTERVAL_SECONDS: "10"
+      SWEEP_TARGET_HOST: pg-replica
+    secrets:
+      - pg_session_sweeper_password
+    configs:
+      - source: pg_sweeper
+        target: /opt/sweeper/pg-sweeper.sh
+    volumes:
+      - pki-ca:/pki-ca:ro
+      - pg-sweeper-log:/var/log/sweeper
+    networks:
+      access:
+        ipv4_address: 10.81.5.21
+    depends_on:
+      log-init:
+        condition: service_completed_successfully
+      pg-replica:
+        condition: service_started
+
+  maria-sweeper:
+    image: mariadb:11.8
+    entrypoint: ["bash", "-c", "set -o pipefail; bash /opt/sweeper/maria-sweeper.sh 2>&1 | tee -a /var/log/sweeper/maria-sweeper.log"]
+    user: "999:999"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m,mode=1777
+    mem_limit: 64m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      SWEEP_INTERVAL_SECONDS: "10"
+      SWEEP_TARGET_HOST: maria-replica
+    secrets:
+      - maria_session_sweeper_password
+    configs:
+      - source: maria_sweeper
+        target: /opt/sweeper/maria-sweeper.sh
+    volumes:
+      - pki-ca:/pki-ca:ro
+      - maria-sweeper-log:/var/log/sweeper
+    networks:
+      access:
+        ipv4_address: 10.81.5.22
+    depends_on:
+      log-init:
+        condition: service_completed_successfully
+      maria-replica:
+        condition: service_started
+
+  dotnet-migrate:
+    build: ./apps/dotnet-api
+    image: security-prototype-phase5-dotnet-api
+    command: ["migrate"]
+    mem_limit: 384m
+    security_opt: ["no-new-privileges:true"]
+    secrets:
+      - source: dotnet_migrator_connstr
+        target: ConnectionStrings__Migrator
+    volumes:
+      - pki-ca:/pki-ca:ro
+    networks:
+      - app1-pg
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  dotnet-api:
+    build: ./apps/dotnet-api
+    image: security-prototype-phase5-dotnet-api
+    mem_limit: 384m
+    security_opt: ["no-new-privileges:true"]
+    secrets:
+      - source: dotnet_app1_connstr
+        target: ConnectionStrings__App1
+    # Phase 5: OTLP to alloy (traces + logs; no metrics backend in the lab). dotnet-migrate uses
+    # the same image without these settings and sends nothing.
+    environment:
+      OTEL_SERVICE_NAME: dotnet-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=lab
+      OTEL_METRICS_EXPORTER: none
+    volumes:
+      - pki-ca:/pki-ca:ro
+    networks:
+      - web
+      - app1-pg
+      - telemetry
+    depends_on:
+      dotnet-migrate:
+        condition: service_completed_successfully
+
+  laravel-migrate:
+    build: ./apps/laravel-api
+    image: security-prototype-phase5-laravel-api
+    command: ["migrate"]
+    mem_limit: 256m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      DB_CONNECTION: mariadb
+      DB_HOST: maria-primary
+      DB_PORT: "3306"
+      DB_DATABASE: app1
+      MIGRATOR_DB_USERNAME: app1_migrator
+      MIGRATOR_DB_PASSWORD_FILE: /run/secrets/maria_app1_migrator_password
+      MYSQL_ATTR_SSL_CA: /pki-ca/ca.crt
+    secrets:
+      - maria_app1_migrator_password
+    volumes:
+      - pki-ca:/pki-ca:ro
+    networks:
+      - app1-maria
+    depends_on:
+      maria-primary:
+        condition: service_healthy
+
+  laravel-api:
+    build: ./apps/laravel-api
+    image: security-prototype-phase5-laravel-api
+    mem_limit: 256m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_KEY_FILE: /run/secrets/laravel_app_key
+      DB_CONNECTION: mariadb
+      DB_HOST: maria-primary
+      DB_PORT: "3306"
+      DB_DATABASE: app1
+      DB_USERNAME: app1_runtime
+      DB_PASSWORD_FILE: /run/secrets/maria_app1_runtime_password
+      MYSQL_ATTR_SSL_CA: /pki-ca/ca.crt
+      SESSION_DRIVER: array
+      CACHE_STORE: array
+      # Phase 5: logs through the OpenTelemetry channel (trace-correlated) instead of stderr,
+      # and PHP auto-instrumentation (Laravel, PDO) to alloy. laravel-migrate sends nothing.
+      LOG_CHANNEL: otel
+      OTEL_PHP_AUTOLOAD_ENABLED: "true"
+      OTEL_SERVICE_NAME: laravel-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=lab
+    secrets:
+      - laravel_app_key
+      - maria_app1_runtime_password
+    volumes:
+      - pki-ca:/pki-ca:ro
+    networks:
+      - web
+      - app1-maria
+      - telemetry
+    depends_on:
+      laravel-migrate:
+        condition: service_completed_successfully
+
+  web:
+    # Phase 5: the Angular bundle is built with Grafana Faro; nginx proxies /faro/ to alloy.
+    build:
+      context: ./apps/web
+      args:
+        FARO_ENABLED: "true"
+        FARO_API_KEY: *faro_api_key
+    image: security-prototype-phase5-web
+    mem_limit: 128m
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "8080:80"
+    networks:
+      - edge
+      - web
+      - telemetry
+    depends_on:
+      dotnet-api:
+        condition: service_started
+      laravel-api:
+        condition: service_started
+
+  # OpenBao: as in phase 3, with the phase 4 configuration (audit file mode 0640 on a volume
+  # the shipper reads). Starts SEALED after every (re)start: run
+  #   scripts\phase2-unseal.ps1 -ComposeFile .\compose.phase4.yaml -Project security-prototype-phase4 -BaoSecretPrefix openbao_phase4
+  openbao:
+    image: openbao/openbao:2.7.2      # MPL-2.0
+    command: ["bao", "server", "-config=/openbao/config/bao.hcl"]
+    mem_limit: 256m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      BAO_ADDR: https://127.0.0.1:8200
+      BAO_CACERT: /pki-ca/ca.crt
+      SKIP_CHOWN: "true"
+    configs:
+      - source: bao_config
+        target: /openbao/config/bao.hcl
+      - source: bao_policy_app1_debug
+        target: /openbao/setup/app1-debug.hcl
+      # Phase 4: policy of the lease reconciler (written by phase4-setup.ps1).
+      - source: bao_policy_lease_reconciler
+        target: /openbao/setup/lease-reconciler.hcl
+    volumes:
+      - bao-data:/openbao/file
+      # Phase 4: nocopy, so Docker does not copy the image's /openbao/logs owner and mode
+      # over the ones log-init.sh set (openbao:4000, 2750).
+      - type: volume
+        source: bao-audit
+        target: /openbao/logs
+        volume:
+          nocopy: true
+      - pki-bao:/pki-bao:ro
+      - pki-ca:/pki-ca:ro
+    ports:
+      - "127.0.0.1:8200:8200"
+    networks:
+      bao-admin:
+        # Fixed: pg_hba.conf and the MariaDB bao_admin host are tied to this address.
+        ipv4_address: 10.81.4.10
+      # Phase 4: OpenBao's path to maria-replica, where it creates the MariaDB temp users.
+      # Fixed: bao_replica_admin exists only for this address.
+      bao-replica:
+        ipv4_address: 10.81.9.10
+      # Phase 4: the lease reconciler's only network. Fixed: the reconciler's AppRole secret ID
+      # and tokens are bound to 10.81.10.20, which OpenBao sees as the client address here.
+      bao-reconciler:
+        ipv4_address: 10.81.10.10
+      lab: {}
+      access: {}
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+      log-init:
+        condition: service_completed_successfully
+
+  # Phase 4: OpenBao lease reconciler (config/reconciler/lease-reconciler.sh). Every
+  # RECONCILE_INTERVAL_SECONDS (15 in the lab; proposal for production: 60) it re-revokes, with
+  # sync=true, database leases whose revocation is pending (TTL 0 in two passes) or irrevocable,
+  # and logs one line per action. Reuses the openbao image for its bao CLI. On bao-reconciler
+  # only (OpenBao and nothing else): it never reaches a database. AppRole credentials are Docker
+  # secrets written by phase4-setup.ps1 (LAB-ONLY files under secrets\; gen-secrets.ps1 writes
+  # placeholders so the files exist before the first "up").
+  lease-reconciler:
+    image: openbao/openbao:2.7.2
+    entrypoint: ["sh", "-c", "set -o pipefail; sh /opt/reconciler/lease-reconciler.sh 2>&1 | tee -a /var/log/reconciler/lease-reconciler.log"]
+    user: "100:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m,mode=1777
+    cap_drop: ["ALL"]
+    mem_limit: 64m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      BAO_ADDR: https://openbao:8200
+      BAO_CACERT: /pki-ca/ca.crt
+      HOME: /tmp
+      RECONCILE_INTERVAL_SECONDS: "15"
+      RECONCILE_MAX_BACKOFF_PASSES: "2"
+      # Phase 4: PostgreSQL replica deny list. OpenBao roles (exact names, space-separated) whose
+      # pending/irrevocable leases get a descriptor in PG_DENY_DIR; must match pg-replica's
+      # PG_DENY_ALLOWED_ROLES. MariaDB roles are never listed here.
+      PG_DENY_ROLES: "app1-pg-ro"
+      PG_DENY_DIR: /pg-deny
+    secrets:
+      - openbao_reconciler_role_id
+      - openbao_reconciler_secret_id
+    configs:
+      - source: lease_reconciler
+        target: /opt/reconciler/lease-reconciler.sh
+    volumes:
+      - pki-ca:/pki-ca:ro
+      - reconciler-log:/var/log/reconciler
+      # Phase 4: the ONLY read-write mount of pg-deny (pg-replica: read-only).
+      - pg-deny:/pg-deny
+    networks:
+      bao-reconciler:
+        ipv4_address: 10.81.10.20
+    depends_on:
+      log-init:
+        condition: service_completed_successfully
+      openbao:
+        condition: service_started
+
+  # Keycloak: unchanged from phase 3. LAB-ONLY dev mode, see phase 2.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2   # Apache-2.0
+    mem_limit: 768m
+    security_opt: ["no-new-privileges:true"]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        export KC_BOOTSTRAP_ADMIN_PASSWORD="$$(< /run/secrets/keycloak_admin_password)"
+        export KC_OPENBAO_CLIENT_SECRET="$$(< /run/secrets/keycloak_openbao_client_secret)"
+        export KC_GRAFANA_CLIENT_SECRET="$$(< /run/secrets/keycloak_grafana_client_secret)"
+        exec /opt/keycloak/bin/kc.sh start-dev --import-realm
+    environment:
+      KC_HTTP_PORT: "8180"
+      KC_HOSTNAME: http://keycloak.localhost:8180
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      JAVA_OPTS_KC_HEAP: "-Xms64m -Xmx384m"
+    secrets:
+      - keycloak_admin_password
+      - keycloak_openbao_client_secret
+      # Phase 5: secret of the Keycloak client "grafana" (config/keycloak/phase5/lab-realm.json).
+      - keycloak_grafana_client_secret
+    configs:
+      - source: keycloak_realm
+        target: /opt/keycloak/data/import/lab-realm.json
+    ports:
+      - "127.0.0.1:8180:8180"
+    networks:
+      lab:
+        aliases:
+          - keycloak.localhost
+      access:
+        aliases:
+          - keycloak.localhost
+
+  # Phase 4: the log shipper (Fluent Bit, Apache-2.0). Reads every source log volume READ-ONLY
+  # (no Docker socket, no container stdout), writes the normalized store and the alerts to
+  # log-store, which no other long-running container mounts. No network at all (not even
+  # loopback services are enabled: HTTP server off), so nothing on "access" or anywhere else can
+  # reach it. Non-root uid 4001, group 4000 (the log-reader group of the source volumes).
+  fluent-bit:
+    image: fluent/fluent-bit:5.1.5
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/phase4/fluent-bit.conf"]
+    user: "4001:4000"
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop: ["ALL"]
+    mem_limit: 128m
+    security_opt: ["no-new-privileges:true"]
+    configs:
+      - source: fluent_bit_conf
+        target: /fluent-bit/etc/phase4/fluent-bit.conf
+      - source: fluent_bit_parsers
+        target: /fluent-bit/etc/phase4/parsers.conf
+      - source: fluent_bit_lua
+        target: /fluent-bit/etc/phase4/audit.lua
+    volumes:
+      - pg-primary-log:/src/pg-primary:ro
+      - pg-replica-log:/src/pg-replica:ro
+      - maria-primary-audit:/src/maria-primary:ro
+      - maria-replica-audit:/src/maria-replica:ro
+      - bao-audit:/src/openbao:ro
+      - pg-sweeper-log:/src/pg-sweeper:ro
+      - maria-sweeper-log:/src/maria-sweeper:ro
+      # Phase 4: lease reconciler log. (The MariaDB backstop log lines are in the
+      # maria-replica-audit volume, subdirectory backstop/, already mounted above.)
+      - reconciler-log:/src/lease-reconciler:ro
+      # The store ("a store developers cannot modify") and the tail offsets.
+      - log-store:/store
+      - fluent-bit-state:/state
+    depends_on:
+      log-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------------------------
+  # Phase 5: debug telemetry. Developer-readable, PII-redacted, short retention. Separate from
+  # the audit pipeline above: none of these containers mounts an audit volume or log-store.
+  # ---------------------------------------------------------------------------------------------
+
+  # One-shot: owners of the telemetry volumes (Loki and Tempo run as 10001, Grafana as 472, and
+  # their images have no shell to do it themselves). Root, no network; reuses postgres:17 for
+  # its shell only, like log-init. Mounts the three telemetry volumes and nothing else.
+  telemetry-init:
+    image: postgres:17
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        chown 10001:10001 /v/loki /v/tempo
+        chown 472:0 /v/grafana
+        chmod 0700 /v/loki /v/tempo /v/grafana
+        echo "telemetry-init: done"
+    user: "0:0"
+    network_mode: none
+    mem_limit: 32m
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - loki-data:/v/loki
+      - tempo-data:/v/tempo
+      - grafana-data:/v/grafana
+
+  # Grafana Alloy (Apache-2.0): OTLP from the APIs, Faro from the browser (through nginx),
+  # redaction, then Loki and Tempo. No published port. Its own UI listens on loopback only.
+  alloy:
+    image: grafana/alloy:v1.21.3
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=127.0.0.1:12345
+      - --storage.path=/tmp/alloy
+      - --disable-reporting
+    user: "473:473"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: ["ALL"]
+    mem_limit: 192m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      GOMEMLIMIT: 150MiB
+      FARO_API_KEY: *faro_api_key
+    configs:
+      - source: alloy_config
+        target: /etc/alloy/config.alloy
+    networks:
+      telemetry:
+        ipv4_address: 10.81.11.10
+      telemetry-store:
+        ipv4_address: 10.81.12.10
+    depends_on:
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+
+  # Loki (AGPL-3.0): logs. Filesystem storage, 7 days. Reachable on telemetry-store only.
+  loki:
+    image: grafana/loki:3.6.22
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    mem_limit: 256m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      GOMEMLIMIT: 200MiB
+    configs:
+      - source: loki_config
+        target: /etc/loki/loki.yaml
+    volumes:
+      - loki-data:/loki
+    networks:
+      telemetry-store:
+        ipv4_address: 10.81.12.11
+    depends_on:
+      telemetry-init:
+        condition: service_completed_successfully
+
+  # Tempo (AGPL-3.0): traces. Filesystem storage, 72 hours. Reachable on telemetry-store only.
+  tempo:
+    image: grafana/tempo:2.10.10
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    mem_limit: 256m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      GOMEMLIMIT: 200MiB
+    configs:
+      - source: tempo_config
+        target: /etc/tempo/tempo.yaml
+    volumes:
+      - tempo-data:/var/tempo
+    networks:
+      telemetry-store:
+        ipv4_address: 10.81.12.12
+    depends_on:
+      telemetry-init:
+        condition: service_completed_successfully
+
+  # Grafana (AGPL-3.0): the developers' view. 127.0.0.1:3000 only. Sign-in through Keycloak
+  # only: app1-devs -> Viewer (Explore on Tempo and Loki), everyone else refused
+  # (role_attribute_strict). No login form, no basic auth, no anonymous access, no sign-up.
+  # The local admin exists for "grafana cli" break-glass inside the container only (it cannot log
+  # in over HTTP: login form and basic auth are off); its password is a Docker secret.
+  grafana:
+    image: grafana/grafana:13.2.6
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    mem_limit: 192m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      GF_SERVER_ROOT_URL: http://localhost:3000/
+      GF_LOG_MODE: console
+      GF_LOG_LEVEL: warn
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SECURITY_ADMIN_USER: lab-admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SECURITY_COOKIE_SAMESITE: lax
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_ORG_CREATE: "false"
+      # Viewers may use Explore (and edit panels temporarily) but cannot save anything.
+      GF_USERS_VIEWERS_CAN_EDIT: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_GENERIC_OAUTH_ENABLED: "true"
+      GF_AUTH_GENERIC_OAUTH_NAME: Keycloak (lab)
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: grafana
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET__FILE: /run/secrets/keycloak_grafana_client_secret
+      GF_AUTH_GENERIC_OAUTH_SCOPES: openid profile email
+      GF_AUTH_GENERIC_OAUTH_USE_PKCE: "true"
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: http://keycloak.localhost:8180/realms/lab/protocol/openid-connect/auth
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: http://keycloak.localhost:8180/realms/lab/protocol/openid-connect/token
+      GF_AUTH_GENERIC_OAUTH_API_URL: http://keycloak.localhost:8180/realms/lab/protocol/openid-connect/userinfo
+      GF_AUTH_GENERIC_OAUTH_SIGNOUT_REDIRECT_URL: http://keycloak.localhost:8180/realms/lab/protocol/openid-connect/logout?client_id=grafana&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Flogin
+      GF_AUTH_GENERIC_OAUTH_LOGIN_ATTRIBUTE_PATH: preferred_username
+      GF_AUTH_GENERIC_OAUTH_NAME_ATTRIBUTE_PATH: preferred_username
+      GF_AUTH_GENERIC_OAUTH_GROUPS_ATTRIBUTE_PATH: groups
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: "contains(groups[*], 'app1-devs') && 'Viewer'"
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_STRICT: "true"
+      GF_AUTH_GENERIC_OAUTH_ALLOW_ASSIGN_GRAFANA_ADMIN: "false"
+      GF_AUTH_GENERIC_OAUTH_SKIP_ORG_ROLE_SYNC: "false"
+      GF_AUTH_GENERIC_OAUTH_AUTO_LOGIN: "true"
+      GF_AUTH_OAUTH_ALLOW_INSECURE_EMAIL_LOOKUP: "false"
+    secrets:
+      - grafana_admin_password
+      - keycloak_grafana_client_secret
+    configs:
+      - source: grafana_datasources
+        target: /etc/grafana/provisioning/datasources/datasources.yaml
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      telemetry-store:
+        ipv4_address: 10.81.12.13
+      lab: {}
+    depends_on:
+      telemetry-init:
+        condition: service_completed_successfully
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+      keycloak:
+        condition: service_started
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 10.81.0.0/24
+  web:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.1.0/24
+  app1-pg:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.2.0/24
+  app1-maria:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.3.0/24
+  # OpenBao (fixed 10.81.4.10) and both primaries: OpenBao's admin connections.
+  bao-admin:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.4.0/24
+  # Where developers connect from. Of the databases, only the replicas are on it.
+  access:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.5.0/24
+  lab:
+    ipam:
+      config:
+        - subnet: 10.81.6.0/24
+  # Phase 3: replication traffic only.
+  pg-repl:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.7.0/24
+  maria-repl:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.8.0/24
+  # Phase 4: OpenBao (10.81.9.10) -> maria-replica (10.81.9.12) only: creation and revocation of
+  # the MariaDB temp users, which live on the replica only.
+  bao-replica:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.9.0/24
+  # Phase 4: OpenBao (10.81.10.10) <- lease-reconciler (10.81.10.20) only.
+  bao-reconciler:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.10.0/24
+  # Phase 5: the apps and the browser proxy (web) -> alloy. Nothing else.
+  telemetry:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.11.0/24
+  # Phase 5: alloy -> loki/tempo, grafana -> loki/tempo. The apps are not on it.
+  telemetry-store:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.12.0/24
+
+volumes:
+  pg-data:
+  maria-data:
+  pg-replica-data:
+  maria-replica-data:
+  pki-ca-key:
+  pki-ca:
+  pki-pg:
+  pki-maria:
+  pki-bao:
+  pki-pg-replica:
+  pki-maria-replica:
+  bao-data:
+  bao-audit:
+  # Phase 4: source logs (one volume per writer) and the shipper's store and state.
+  pg-primary-log:
+  pg-replica-log:
+  maria-primary-audit:
+  maria-replica-audit:
+  pg-sweeper-log:
+  maria-sweeper-log:
+  reconciler-log:
+  log-store:
+  fluent-bit-state:
+  # Phase 4: PostgreSQL deny-list descriptors: lease-reconciler (rw) -> pg-replica (ro).
+  pg-deny:
+  # Phase 5: telemetry stores (not audit data; owners set by telemetry-init).
+  loki-data:
+  tempo-data:
+  grafana-data:
+
+configs:
+  pki_init:
+    file: ./config/pki/pki-init.sh
+  log_init:
+    file: ./config/logs/log-init.sh
+  pg_init_roles:
+    file: ./config/postgres/10-app1-roles.sh
+  pg_init_replication:
+    file: ./config/postgres/20-replication.sh
+  pg_phase4_audit_roles:
+    file: ./config/postgres/phase4-audit-roles.sh
+  pg_phase2_access_setup:
+    file: ./config/postgres/phase2-access-setup.sh
+  pg_phase3_access_setup:
+    file: ./config/postgres/phase3-access-setup.sh
+  pg_replica_entrypoint:
+    file: ./config/postgres/replica-entrypoint.sh
+  pg_deny_watcher:
+    file: ./config/postgres/pg-deny-watcher.sh
+  maria_replica_entrypoint:
+    file: ./config/mariadb/replica-entrypoint.sh
+  # Phase 4 variants and additions for MariaDB (config/mariadb/phase4/).
+  maria_phase4_init_users:
+    file: ./config/mariadb/phase4/10-app1-users.sh
+  maria_phase4_init_replication:
+    file: ./config/mariadb/phase4/20-replication.sh
+  maria_phase4_phase2_access_setup:
+    file: ./config/mariadb/phase4/phase2-access-setup.sh
+  maria_phase4_phase3_access_setup:
+    file: ./config/mariadb/phase4/phase3-access-setup.sh
+  maria_phase4_replica_seed:
+    file: ./config/mariadb/phase4/20-replica-seed.sh
+  maria_phase4_replica_bao_account:
+    file: ./config/mariadb/phase4/replica-bao-account.sh
+  maria_phase4_replica_entrypoint:
+    file: ./config/mariadb/phase4/replica-entrypoint.sh
+  maria_phase4_replica_init:
+    file: ./config/mariadb/phase4/replica-init.sql.tmpl
+  lease_reconciler:
+    file: ./config/reconciler/lease-reconciler.sh
+  bao_policy_lease_reconciler:
+    file: ./config/openbao/lease-reconciler.hcl
+  pg_sweeper:
+    file: ./config/sweeper/pg-sweeper.sh
+  maria_sweeper:
+    file: ./config/sweeper/maria-sweeper.sh
+  bao_config:
+    file: ./config/openbao/bao.phase4.hcl
+  bao_policy_app1_debug:
+    file: ./config/openbao/app1-debug.hcl
+  keycloak_realm:
+    file: ./config/keycloak/phase5/lab-realm.json
+  fluent_bit_conf:
+    file: ./config/fluent-bit/fluent-bit.conf
+  fluent_bit_parsers:
+    file: ./config/fluent-bit/parsers.conf
+  fluent_bit_lua:
+    file: ./config/fluent-bit/audit.lua
+  # Phase 5: telemetry configs (config/telemetry/, adapted from balagus/telemetries).
+  alloy_config:
+    file: ./config/telemetry/alloy/config.alloy
+  loki_config:
+    file: ./config/telemetry/loki/loki.yaml
+  tempo_config:
+    file: ./config/telemetry/tempo/tempo.yaml
+  grafana_datasources:
+    file: ./config/telemetry/grafana/datasources.yaml
+  # Primary. First match wins.
+  # - bao_admin is a member of debug_ro (ADMIN OPTION only, INHERIT FALSE, SET FALSE), and a
+  #   "+debug_ro" line still matches it, so its own line MUST come before the reject.
+  # - No PHASE2-FALLBACK line: temp users (members of debug_ro) are rejected from everywhere.
+  # - "all" in the DATABASE column does not match replication connections, hence the explicit
+  #   replication lines.
+  pg_hba_primary:
+    content: |
+      # TYPE  DATABASE     USER           ADDRESS        METHOD
+      local   all          postgres                      peer
+      hostssl app1         bao_admin      10.81.4.10/32  scram-sha-256
+      host    all          +debug_ro      all            reject
+      hostssl app1         app1_runtime   10.81.2.0/24   scram-sha-256
+      hostssl app1         app1_migrator  10.81.2.0/24   scram-sha-256
+      hostssl replication  replicator     10.81.7.11/32  scram-sha-256
+      host    replication  all            all            reject
+      host    all          all            all            reject
+  # Replica. bao_admin replicates from the primary and is a member of debug_ro, so it would
+  # match the +debug_ro line: reject it first. The sweeper only from its fixed address.
+  # Phase 4: line 2 rejects every role named in the deny list that pg-deny-watcher.sh builds from
+  # the reconciler's descriptors (revoked temp roles while the primary is down). It comes before
+  # every allow line. The file always holds at least the sentinel /^$ (matches no role); its
+  # other tokens are /^v-...$ patterns only. Columns: TYPE DATABASE USER ADDRESS METHOD (no
+  # header line, so the line numbers of the other rules are those of phase 3).
+  pg_hba_replica:
+    content: |
+      local   all          postgres                        peer
+      host    all          @/var/lib/postgresql/pg-deny/denied_roles  all  reject
+      host    all          bao_admin        all            reject
+      hostssl app1         +debug_ro        10.81.5.0/24   scram-sha-256
+      hostssl app1         session_sweeper  10.81.5.21/32  scram-sha-256
+      host    replication  all              all            reject
+      host    all          all              all            reject
+
+secrets:
+  pg_superuser_password:
+    file: ./secrets/pg_superuser_password
+  pg_app1_migrator_password:
+    file: ./secrets/pg_app1_migrator_password
+  pg_app1_runtime_password:
+    file: ./secrets/pg_app1_runtime_password
+  maria_root_password:
+    file: ./secrets/maria_root_password
+  maria_app1_migrator_password:
+    file: ./secrets/maria_app1_migrator_password
+  maria_app1_runtime_password:
+    file: ./secrets/maria_app1_runtime_password
+  laravel_app_key:
+    file: ./secrets/laravel_app_key
+  dotnet_app1_connstr:
+    file: ./secrets/dotnet_app1_connstr
+  dotnet_migrator_connstr:
+    file: ./secrets/dotnet_migrator_connstr
+  pg_bao_admin_initial_password:
+    file: ./secrets/pg_bao_admin_initial_password
+  maria_bao_admin_initial_password:
+    file: ./secrets/maria_bao_admin_initial_password
+  keycloak_admin_password:
+    file: ./secrets/keycloak_admin_password
+  keycloak_openbao_client_secret:
+    file: ./secrets/keycloak_openbao_client_secret
+  pg_replicator_password:
+    file: ./secrets/pg_replicator_password
+  maria_replicator_password:
+    file: ./secrets/maria_replicator_password
+  pg_session_sweeper_password:
+    file: ./secrets/pg_session_sweeper_password
+  maria_session_sweeper_password:
+    file: ./secrets/maria_session_sweeper_password
+  # Phase 4: AppRole credentials of lease-reconciler, written by phase4-setup.ps1 (LAB-ONLY).
+  openbao_reconciler_role_id:
+    file: ./secrets/openbao_phase5_reconciler_role_id
+  openbao_reconciler_secret_id:
+    file: ./secrets/openbao_phase5_reconciler_secret_id
+  # Phase 5: Grafana's local break-glass admin and its Keycloak client secret (gen-secrets.ps1).
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password
+  keycloak_grafana_client_secret:
+    file: ./secrets/keycloak_grafana_client_secret

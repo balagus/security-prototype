@@ -1,0 +1,146 @@
+{
+  "realm": "lab",
+  "displayName": "LAB-ONLY test realm (security-prototype phase 5: phase 2 realm plus the Grafana client)",
+  "enabled": true,
+  "sslRequired": "external",
+  "editUsernameAllowed": false,
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "bruteForceProtected": true,
+  "accessTokenLifespan": 300,
+  "attributes": {
+    "lab_note": "LAB-ONLY. Test users with test passwords that live only in this seed file. Keycloak runs in dev mode over plain HTTP."
+  },
+  "groups": [
+    { "name": "app1-devs", "path": "/app1-devs" },
+    { "name": "lab-users", "path": "/lab-users" }
+  ],
+  "defaultGroups": [ "/lab-users" ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@lab.localhost",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Lab",
+      "credentials": [ { "type": "password", "value": "G0QEJxf9fnddMGVUGL0tneJW", "temporary": false } ],
+      "groups": [ "/app1-devs", "/lab-users" ]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@lab.localhost",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Lab",
+      "credentials": [ { "type": "password", "value": "eftPcdwwQWQFzZuxEzAmuWv7", "temporary": false } ],
+      "groups": [ "/lab-users" ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "openbao",
+      "name": "OpenBao (OIDC auth method, interactive login)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${KC_OPENBAO_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "https://localhost:8200/ui/vault/auth/oidc/oidc/callback",
+        "https://127.0.0.1:8200/ui/vault/auth/oidc/oidc/callback",
+        "http://localhost:8250/oidc/callback"
+      ],
+      "webOrigins": [],
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "grafana",
+      "name": "Grafana (phase 5 debug telemetry, interactive login)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${KC_GRAFANA_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": true,
+      "redirectUris": [ "http://localhost:3000/login/generic_oauth" ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3000/login"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "bao-jwt-test",
+      "name": "LAB-ONLY: direct-access-grant client for the automated tests (jwt auth method)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}
