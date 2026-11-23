@@ -1,0 +1,5 @@
+I want to harden the security, DB, production access of our existing applications. 
+These apps have an angular frontend, and backends are: .NET10 - postgres, laravel 13 - mariaDB.
+Everything is containerized. (separate backends, and DBs)
+I want you to create a basic simulated environment. 
+You can install Docker, or anything to this machine, it is not my main PC, its just a throwaway system.

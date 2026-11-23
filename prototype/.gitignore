@@ -1,0 +1,2 @@
+# Generated Docker secrets (scripts/gen-secrets.ps1). Never commit.
+secrets/
