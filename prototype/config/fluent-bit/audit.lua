@@ -441,6 +441,49 @@ local function normalize_backstop(source, r, engine)
   return out
 end
 
+-- Phase 6: approval portal (apps/portal/AuditLog.cs), one JSON object per line with
+--   time, action, outcome, actor, request_id, requester, app, group, ticket, duration_minutes,
+--   expires_at, client_ip, detail
+-- Alert rules (phase 6):
+--   portal_self_approval   someone tried to approve their own request (refused)
+--   portal_approval_refused someone outside the approver group tried to approve or deny (refused)
+--   portal_membership_drift a member of a managed group (app1-devs) has no active, approved
+--                          grant: added outside the portal (the portal removes it in the lab)
+--   portal_grant_membership_missing an active grant's membership was removed outside the portal
+--   portal_keycloak_error  the portal could not add or remove a membership (it retries removals)
+local function normalize_portal(source, r)
+  local out = {
+    timestamp = r["time"],
+    source = source,
+    engine = "portal",
+    event = r["action"],
+    outcome = r["outcome"],
+    user = r["actor"],
+    requester = r["requester"],
+    request_id = r["request_id"],
+    app = r["app"],
+    group = r["group"],
+    ticket = r["ticket"],
+    duration_minutes = r["duration_minutes"],
+    expires_at = r["expires_at"],
+    client_host = r["client_ip"],
+    detail = r["detail"],
+  }
+  local ev = out.event
+  if ev == "self-approval-refused" then
+    set_alert(out, "portal_self_approval", tostring(out.user) .. " tried to approve their own request " .. tostring(out.request_id))
+  elseif ev == "approval-refused" then
+    set_alert(out, "portal_approval_refused", tostring(out.user) .. " is not an approver but tried to decide request " .. tostring(out.request_id))
+  elseif ev == "membership-drift" then
+    set_alert(out, "portal_membership_drift", tostring(out.requester) .. " is in " .. tostring(out.group) .. " without an approved grant")
+  elseif ev == "grant-membership-missing" then
+    set_alert(out, "portal_grant_membership_missing", tostring(out.requester) .. " was removed from " .. tostring(out.group) .. " outside the portal")
+  elseif ev == "membership-add-failed" or ev == "membership-remove-failed" then
+    set_alert(out, "portal_keycloak_error", ev .. ": " .. tostring(out.detail))
+  end
+  return out
+end
+
 -- Image healthchecks connect every 5 s (PostgreSQL: local socket as postgres with
 -- application_name pg-healthcheck; MariaDB: the local "healthcheck" account). Their routine
 -- connect/disconnect records are not shipped (about 100,000 lines a day per server); they stay
@@ -476,6 +519,8 @@ function normalize(tag, timestamp, record)
     out = normalize_backstop(source, record, "backstop")
   elseif kind == "reconciler" then
     out = normalize_backstop(source, record, "reconciler")
+  elseif kind == "portal" then
+    out = normalize_portal(source, record)
   else
     return 0, timestamp, record
   end

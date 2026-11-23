@@ -1,0 +1,155 @@
+# Phase 6: the access approval portal (design 4.C, "Approval design"). ADD-ON to phase 5, not a
+# standalone file: it is always used together with compose.phase5.yaml and runs in the same
+# project (security-prototype-phase5), so the phase 5 stack and its data stay as they are.
+#
+#   docker compose -f compose.phase5.yaml -f compose.phase6.yaml up -d --build
+#   powershell -ExecutionPolicy Bypass -File .\scripts\phase6-setup.ps1
+#   powershell -ExecutionPolicy Bypass -File .\tests\phase6-checks.ps1
+#
+# Before first start: scripts\gen-secrets.ps1 (writes the three phase 6 secrets). The add-on
+# leaves every phase 5 service definition as it is except fluent-bit (one more read-only source).
+# phase6-setup.ps1 attaches Keycloak to portal-idp and writes the phase 6 Keycloak configuration
+# (idempotent; run it again whenever Keycloak was recreated). OpenBao, the databases and every
+# phase 2 to 5 setting are not touched.
+# To go back to plain phase 5: "docker compose -f compose.phase5.yaml up -d --remove-orphans".
+#
+# What phase 6 adds:
+#   - portal (apps/portal): ASP.NET Core 10 API + Angular UI in one container, on
+#     127.0.0.1:8090 only. People sign in through Keycloak (client "portal"). A developer
+#     requests access to app1 with a ticket ID, a reason and a duration; a member of
+#     app1-approvers who is not the requester approves; the portal then adds the requester to the
+#     Keycloak group app1-devs, which OpenBao already maps to the app1-debug policy (phase 2),
+#     and removes the membership at expiry or on revocation. The developer still logs in to
+#     OpenBao personally. The portal has no OpenBao token and no database access.
+#   - Group changes use the service account of the Keycloak client "portal-group-manager". Its
+#     Keycloak fine-grained admin permissions (set by phase6-setup.ps1) allow only: view the
+#     group app1-devs and its members, and add or remove a user to or from it.
+#   - Every portal action is one JSON line in portal-log (portal-audit.log), which fluent-bit
+#     ships to log-store with the other audit records (config/fluent-bit/phase6/fluent-bit.conf,
+#     normalize_portal in config/fluent-bit/audit.lua) and five new alert rules.
+#   - A drift check (every 15 s here) removes and alerts on any app1-devs member without an
+#     approved, active grant. LAB-ONLY: alice stays a standing member (phases 2 to 5 tests).
+#   - Networks: portal-edge (published port only) and portal-idp (internal: portal and
+#     Keycloak). The portal is on no other network: it cannot reach OpenBao or any database.
+#   - Volumes: portal-data (SQLite request store, cookie keys; owner 1654, 0700) and portal-log
+#     (owner 1654, group 4000, 2750, the phase 4 log-reader model), prepared by portal-init.
+#
+# Fixed addresses:
+#   portal-edge 10.81.13.0/24
+#   portal-idp  10.81.14.0/24  keycloak .10, portal .20
+
+services:
+
+  # One-shot: owners and modes of the portal volumes (same model as log-init, phase 4).
+  portal-init:
+    image: postgres:17
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        chown 1654:1654 /v/portal-data
+        chmod 0700 /v/portal-data
+        chown 1654:4000 /v/portal-log
+        chmod 2750 /v/portal-log
+        find /v/portal-log -mindepth 1 -type f -exec chgrp 4000 {} + -exec chmod g+r,g-w,o-rwx {} +
+        echo "portal-init: done"
+    user: "0:0"
+    network_mode: none
+    mem_limit: 32m
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - portal-data:/v/portal-data
+      - portal-log:/v/portal-log
+
+  portal:
+    build:
+      context: ./apps/portal
+    image: security-prototype-phase6-portal
+    user: "1654:1654"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    mem_limit: 192m
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      HOME: /tmp
+      DOTNET_gcServer: "0"
+      Portal__Authority: http://keycloak.localhost:8180/realms/lab
+      # Back-channel: keycloak.localhost is the issuer (and what the browser uses); inside
+      # Docker the container is reached as "keycloak" on portal-idp.
+      Portal__IdpConnectHost: keycloak
+      Portal__ApproverGroup: app1-approvers
+      Portal__ClientSecretFile: /run/secrets/keycloak_portal_client_secret
+      Portal__GroupManagerSecretFile: /run/secrets/keycloak_portal_group_manager_secret
+      Portal__MaxDurationMinutes: "240"
+      # LAB-ONLY: production uses 60 (1 h minimum, design principle 2 says 1 to 4 h). 1 minute
+      # lets the tests watch an expiry.
+      Portal__MinDurationMinutes: "1"
+      Portal__ReconcileSeconds: "15"
+      Portal__DriftAction: remove
+      # LAB-ONLY: alice is a permanent app1-devs member in the realm seed (phases 2 to 5).
+      Portal__StandingMembers__0: alice
+      # LAB-ONLY: Bearer tokens of the test client "portal-test" (tests\phase6-checks.ps1).
+      Portal__AcceptBearer: "true"
+    secrets:
+      - keycloak_portal_client_secret
+      - keycloak_portal_group_manager_secret
+    volumes:
+      - portal-data:/data
+      - type: volume
+        source: portal-log
+        target: /var/log/portal
+        volume:
+          nocopy: true
+    ports:
+      - "127.0.0.1:8090:8080"
+    networks:
+      portal-edge: {}
+      portal-idp:
+        ipv4_address: 10.81.14.20
+    depends_on:
+      portal-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+
+  # Keycloak is NOT redefined here. Changing its networks in this file would recreate it, and a
+  # recreated Keycloak (dev mode, database inside the container) re-imports the realm with new
+  # user IDs, which breaks Grafana's stored sign-in links (measured). phase6-setup.ps1 attaches
+  # the running Keycloak container to portal-idp instead ("docker network connect", idempotent).
+
+  # The shipper also reads the portal's audit log (read-only) with the phase 6 configuration.
+  fluent-bit:
+    volumes:
+      - portal-log:/src/portal:ro
+    depends_on:
+      portal-init:
+        condition: service_completed_successfully
+
+networks:
+  # Only for the published port (an internal network cannot publish one).
+  portal-edge:
+    ipam:
+      config:
+        - subnet: 10.81.13.0/24
+  portal-idp:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.14.0/24
+
+volumes:
+  portal-data:
+  portal-log:
+
+configs:
+  fluent_bit_conf:
+    file: ./config/fluent-bit/phase6/fluent-bit.conf
+
+secrets:
+  keycloak_portal_client_secret:
+    file: ./secrets/keycloak_portal_client_secret
+  keycloak_portal_group_manager_secret:
+    file: ./secrets/keycloak_portal_group_manager_secret

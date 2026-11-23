@@ -3,7 +3,7 @@
 Date: 2026-11-17
 Revision 8
 
-**Status:** Phases 0 to 4 were executed in the prototype: sections 4.A, 4.B, 4.C (replica path), 4.E (database audit and shipping) and 5. Test counts against the phase 4 stack: 13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently). The MariaDB binary-log password leak found in phase 4 is fixed and tested (4.E, 5.3). Phase 5 (debug telemetry: traces and logs in Grafana, redacted, separate from the audit store) was executed on 2026-11-23: 27 phase 5 checks and 13 smoke checks pass; the phase 4 suite on the phase 5 stack passes 94 of 96 (two app-request checks hit dropped host connections, 7.5). The approval portal, Warpgate and break-glass (now phase 6) have **not** been executed. Host access controls (4.D) have **not** been executed. Items still marked "to test" remain unverified.
+**Status:** Phases 0 to 4 were executed in the prototype: sections 4.A, 4.B, 4.C (replica path), 4.E (database audit and shipping) and 5. Test counts against the phase 4 stack: 13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently). The MariaDB binary-log password leak found in phase 4 is fixed and tested (4.E, 5.3). Phase 5 (debug telemetry: traces and logs in Grafana, redacted, separate from the audit store) was executed on 2026-11-23: 27 phase 5 checks and 13 smoke checks pass; the phase 4 suite on the phase 5 stack passes 94 of 96 (two app-request checks hit dropped host connections, 7.5). The approval portal (phase 6, 4.C "Approval design") was built and tested on 2026-11-23 as an add-on to the phase 5 stack: 83 phase 6 checks pass. Warpgate and the break-glass role and alert (rest of phase 6) have **not** been executed. Host access controls (4.D) have **not** been executed. Items still marked "to test" remain unverified.
 
 **Main open problem:** none on revocation. On PostgreSQL a role revoked while the primary is down is refused by the replica within one reconciler interval plus 2 s (replica-side deny list, 5.4).
 
@@ -99,6 +99,7 @@ GDPR angle (EU): data minimization means masking by default; audit logs show who
 | OpenTelemetry SDKs (.NET, PHP), Grafana Faro Web SDK | Apache-2.0 | Traces and logs from the APIs and the browser (phase 5). |
 | nginx | BSD-2-Clause | Serves the Angular app, reverse proxy to the APIs. |
 | .NET / Npgsql / Laravel / Angular | MIT / PostgreSQL License / MIT / MIT | Application stack. |
+| ASP.NET Core OpenID Connect and JwtBearer handlers, Microsoft.Data.Sqlite (SQLite: public domain) | MIT | Approval portal (phase 6). |
 | Docker Engine | Apache-2.0 | Container runtime. Docker Desktop is commercial, covered by the existing subscription. |
 
 ### 3.2 Optional
@@ -278,17 +279,24 @@ Consequences:
 
 **Fallback if production has no replicas.** Point the read-only role at the primary, restricted by firewall and `pg_hba.conf` / host mask, with forced timeouts and connection limits. Add replicas later.
 
-#### Approval design (proposed, to validate)
+#### Approval design (built and tested in phase 6)
 
-OpenBao has no approval feature. The thin portal (C# API + Angular) fills that gap:
+OpenBao has no approval feature. The thin portal (C# API + Angular, `prototype/apps/portal`) fills that gap:
 
-1. Developer requests access: app, ticket ID, duration.
-2. An approver confirms. The portal records ticket ID and approver.
+1. Developer requests access: app, ticket ID, reason, duration (1 to 4 h).
+2. An approver (Keycloak group `app1-approvers`) confirms or denies. Nobody can approve their own request. The portal records ticket ID and approver.
 3. The portal adds the developer to the Keycloak group `app1-devs` through the Keycloak admin API, using a service account limited to group management.
-4. On expiry, the portal removes the membership.
-5. The developer still logs in to OpenBao personally and fetches credentials. The OpenBao identity is the person, not the portal.
+4. On expiry or early revocation, the portal removes the membership.
+5. The developer still logs in to OpenBao personally and fetches credentials. The OpenBao identity is the person, not the portal. The portal has no OpenBao token and no database access.
+6. A drift check removes any `app1-devs` member without an approved, active grant and raises an alert.
 
-To test: group changes reach OpenBao at the next login or token renewal, so removal is not instant. The 4 h token max TTL bounds the delay.
+Measured in the lab (2026-11-23, `tests/phase6-checks.ps1`, 83 checks):
+
+- Approval to working OpenBao credentials: 2.3 to 2.6 s. Membership removed 4.9 to 8.3 s after expiry, with a 15 s check interval. An out-of-band membership was removed after 12.7 to 13.7 s.
+- Keycloak in dev mode keeps its database inside the container. A recreated container re-imports the realm with new user IDs, and Grafana's stored sign-in links then fail (measured). The add-on therefore never redefines Keycloak; the setup attaches it to the portal network at runtime. The portal looks up group IDs again on any 404, so a stale ID never turns a removal into a no-op.
+- **Removal is not instant in OpenBao.** A token issued before the removal keeps reading credentials, and `bao token renew` does not change that. The developer's next login re-reads the groups and cuts **every** token of that person, because external group membership belongs to the OpenBao entity. Without a new login, the token TTL bounds the delay (4 h max). Database credentials already issued live until their lease ends. Closing this gap would need the portal to revoke the person's tokens or leases in OpenBao, which needs an OpenBao token with that right. Not built.
+- **Service account limits (Keycloak 26.8.2, fine-grained admin permissions v2).** Two permissions are needed for a membership change: Groups `app1-devs` `manage-membership` and Users `manage-group-membership`. With those alone, the group search and group member endpoints return empty lists. The account therefore also has the read-only `view-users` role, so it can read the whole user directory. Writes are limited to `app1-devs`; ten other admin writes were tested and refused. The token also needs the `kc-admin-api` client scope (audience of the admin API), or every call returns 401.
+- Every portal action is shipped to the audit store with ticket, requester, approver and group, next to the OpenBao record that maps the person to the database user. There are five new alert rules.
 
 #### Write and break-glass path
 
@@ -1010,7 +1018,7 @@ bao token revoke -self
 
 - **Keep temp users read-only.** A user that creates objects cannot be dropped cleanly, and the lease becomes hard to revoke.
 - **OpenBao does not mask data.** Use views.
-- **Approvals are not built into OpenBao.** That is the job of the portal (4.C).
+- **Approvals are not built into OpenBao.** That is the job of the portal (4.C). Removing a Keycloak group membership does not end OpenBao tokens that were already issued until the person logs in again or the token expires (measured, 4.C).
 - **OpenBao is critical infrastructure and the trust root.** Plan unsealing, backups, and who holds unseal keys. Revoke the root token after setup.
 - **PostgreSQL replica lag** delays both new credentials and revocation. An orphaned session keeps running until the sweeper kills it (5.4).
 - **Revocation during a database outage.** MariaDB is covered by the startup purge, the expiry event and the lease reconciler (5.4). On PostgreSQL a role revoked while the primary is down is refused by the replica's deny list within one reconciler interval plus 2 s (5.4). The deny list has its own limits (7.5).
@@ -1046,7 +1054,7 @@ Goal: prove all five workstreams end to end on disposable infrastructure: a Wind
 | 3 Replicas | PostgreSQL streaming replica (`pg_basebackup` bootstrap), MariaDB replica (`server_id`, binlog, GTID), `pg_hba.conf` split, sweepers. | Replica tests in 7.4 pass. | Done 2026-11-17. Streaming replica and GTID replica over verified TLS, `pg_hba.conf` split, primaries off the access network, sweepers, stale-user report (13 smoke, 38 hardening, 83 access, 93 replica checks). |
 | 4 Workstream E | pgAudit (custom image) and `server_audit` on all servers, Fluent Bit to a volume only the log container mounts. | Audit tests in 7.4 pass. | Done 2026-11-17. pgAudit and `server_audit` on all four servers, Fluent Bit to an isolated store, lab alert rules, MariaDB binary-log password leak fixed by replica-only temp users and hash-only password statements. Revocation backstops: MariaDB startup purge and replica-local expiry event, a lease reconciler for both engines, and a PostgreSQL replica-side deny list (watcher inside pg-replica), with eight new alerts (13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently)). |
 | 5 Debug telemetry (principle 1) | Traces and logs from the browser (Grafana Faro) and both APIs (OpenTelemetry) through Grafana Alloy to Loki and Tempo, read in Grafana with Keycloak sign-in. Redaction before storage. Configuration adapted from the existing `telemetries` repository. Separate from the audit pipeline. | One request gives one trace browser -> API -> SQL with correlated logs; sentinel personal data appears in no trace or log line; no telemetry container touches an audit volume; Grafana admits `app1-devs` only. | Done 2026-11-23 (27 phase 5 checks, 13 smoke; phase 4 suite on the phase 5 stack 94 of 96, see 7.5). Browser path also checked by hand in a real browser. |
-| 6 Optional | Approval portal, Warpgate, break-glass role and alert. | As scoped then. | Not started. |
+| 6 Optional | Approval portal, Warpgate, break-glass role and alert. | Portal: requests with ticket and approver; no self-approval; the membership exists only while a grant is active; every step reaches the audit store; the service account cannot change anything else. | Portal done 2026-11-23 as an add-on to the phase 5 stack (`compose.phase6.yaml`, 83 phase 6 checks; see 4.C). Warpgate and break-glass not started. |
 
 ### 7.3 Windows notes
 

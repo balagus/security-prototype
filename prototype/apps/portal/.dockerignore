@@ -1,0 +1,8 @@
+bin/
+obj/
+.vs/
+ui/node_modules/
+ui/dist/
+ui/.angular/
+Dockerfile
+.dockerignore

@@ -123,6 +123,20 @@ foreach ($n in @(
     Write-Secret $n { New-RandomPassword 32 }
 }
 
+# Phase 6 (compose.phase6.yaml, the approval portal). Earlier phases ignore these files.
+# - keycloak_portal_client_secret: client secret of the confidential Keycloak client "portal"
+#   (people sign in to the portal with it).
+# - keycloak_portal_group_manager_secret: client secret of the service-account client
+#   "portal-group-manager" (the portal adds and removes app1-devs memberships with it).
+# - keycloak_carol_password: LAB-ONLY test approver "carol" (created by phase6-setup.ps1).
+# phase6-setup.ps1 writes all three values into Keycloak.
+foreach ($n in @(
+        'keycloak_portal_client_secret',
+        'keycloak_portal_group_manager_secret',
+        'keycloak_carol_password')) {
+    Write-Secret $n { New-RandomPassword 32 }
+}
+
 # Laravel APP_KEY (AES-256-CBC needs 32 random bytes).
 Write-Secret 'laravel_app_key' { 'base64:' + [Convert]::ToBase64String((New-RandomBytes 32)) }
 
