@@ -1,0 +1,226 @@
+<header class="top">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <span>Production access</span>
+    <span class="env">LAB</span>
+  </div>
+  @if (me(); as m) {
+    <div class="who">
+      <span class="name">{{ m.name }}</span>
+      <span class="user">{{ m.username }}</span>
+      @if (m.isApprover) { <span class="chip">approver</span> }
+      <a class="signout" href="/signout">Sign out</a>
+    </div>
+  }
+</header>
+
+@if (toast(); as t) {
+  <div class="toast" [class.bad]="t.kind === 'bad'" role="status">{{ t.text }}</div>
+}
+
+<main>
+  @if (signedOut()) {
+    <section class="card signin">
+      <h1>Just-in-time database access</h1>
+      <p>Request temporary, read-only access to production data. Another person approves it, and it ends on its own.</p>
+      <a class="btn primary" href="/signin">Sign in with Keycloak</a>
+    </section>
+  } @else if (loadError() && !me()) {
+    <section class="card signin"><p class="error">{{ loadError() }}</p></section>
+  } @else if (me(); as m) {
+
+    @if (loadError()) { <p class="error banner">{{ loadError() }}</p> }
+
+    <div class="layout">
+      <section class="card">
+        <h2>Request access</h2>
+        @if (myActive(); as a) {
+          <div class="grant">
+            <div class="grant-head">
+              <span class="badge active">active</span>
+              <strong>{{ a.app }}</strong>
+              <span class="mono">{{ a.ticket }}</span>
+              <span class="spacer"></span>
+              <span class="left">{{ remaining(a) }}</span>
+            </div>
+            <div class="bar"><span [style.width.%]="progress(a)"></span></div>
+            <p class="hint">You are in <span class="mono">{{ a.group }}</span>. Sign in to OpenBao again to pick it up, then read
+              <span class="mono">database/creds/app1-pg-ro</span> or <span class="mono">database/creds/app1-maria-ro</span>.</p>
+          </div>
+        }
+        <form (submit)="submit($event)" novalidate>
+          <label>
+            <span>Application</span>
+            <select [value]="fApp()" (change)="fApp.set(value($event))">
+              @for (a of m.apps; track a.id) { <option [value]="a.id">{{ a.name }}</option> }
+            </select>
+          </label>
+          @for (a of m.apps; track a.id) {
+            @if (a.id === fApp()) { <p class="hint">{{ a.description }}</p> }
+          }
+          <div class="row">
+            <label class="grow">
+              <span>Ticket</span>
+              <input [value]="fTicket()" (input)="fTicket.set(value($event))" [placeholder]="m.ticketExample" autocomplete="off" spellcheck="false" maxlength="20">
+            </label>
+            <label>
+              <span>Duration</span>
+              <select [value]="'' + fDuration()" (change)="fDuration.set(+value($event))">
+                @for (d of durations(); track d) { <option [value]="'' + d">{{ dur(d) }}</option> }
+              </select>
+            </label>
+          </div>
+          <label>
+            <span>Reason</span>
+            <textarea rows="3" maxlength="500" [value]="fReason()" (input)="fReason.set(value($event))"
+              placeholder="What you need to look at, and why telemetry is not enough"></textarea>
+          </label>
+          @if (formError()) { <p class="error">{{ formError() }}</p> }
+          @if (openForApp(); as o) {
+            <p class="hint">You already have a {{ o.status }} request for {{ o.app }} ({{ o.ticket }}).</p>
+          }
+          <button class="btn primary" type="submit" [disabled]="busy() === 'create' || !!openForApp()">
+            {{ busy() === 'create' ? 'Sending…' : 'Request access' }}
+          </button>
+        </form>
+      </section>
+
+      <aside class="card how">
+        <h2>How it works</h2>
+        <ol>
+          <li><strong>Request</strong> with a ticket and a reason.</li>
+          <li><strong>Approval</strong> by someone in <span class="mono">{{ m.approverGroup }}</span>, never yourself.</li>
+          <li>The portal adds you to the Keycloak group of the app until the grant expires.</li>
+          <li>You sign in to <strong>OpenBao</strong> yourself and read short-lived, read-only credentials for the replicas.</li>
+          <li>At expiry the membership is removed. OpenBao tokens you already hold keep working until their own TTL.</li>
+        </ol>
+        <p class="hint">Every step is written to the audit store with the ticket and the approver.</p>
+      </aside>
+    </div>
+
+    @if (m.isApprover) {
+      <section class="card">
+        <h2>Waiting for your decision <span class="count">{{ pendingForMe().length }}</span></h2>
+        @for (r of pendingForMe(); track r.id) {
+          <article class="pending">
+            <div class="p-main">
+              <div class="p-title">
+                <strong>{{ r.requester }}</strong> asks for <strong>{{ r.app }}</strong> for {{ dur(r.durationMinutes) }}
+                <span class="mono tag">{{ r.ticket }}</span>
+              </div>
+              <p class="reason">{{ r.reason }}</p>
+              <div class="meta">requested {{ ago(r.createdAt) }} · group <span class="mono">{{ r.group }}</span></div>
+            </div>
+            <div class="p-act">
+              <input [value]="comments()[r.id] ?? ''" (input)="setComment(r.id, value($event))" placeholder="Comment (required to deny)" maxlength="500">
+              <div class="btns">
+                <button class="btn primary" (click)="act(r, 'approve')" [disabled]="!!busy()">Approve</button>
+                <button class="btn danger" (click)="act(r, 'deny')" [disabled]="!!busy()">Deny</button>
+              </div>
+            </div>
+          </article>
+        } @empty {
+          <p class="empty">Nothing to decide.</p>
+        }
+      </section>
+
+      <section class="card">
+        <h2>Active grants <span class="count">{{ activeGrants().length }}</span></h2>
+        @if (activeGrants().length) {
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Who</th><th>App</th><th>Ticket</th><th>Approved by</th><th>Time left</th><th></th></tr></thead>
+              <tbody>
+                @for (r of activeGrants(); track r.id) {
+                  <tr>
+                    <td>{{ r.requester }}</td>
+                    <td>{{ r.app }}</td>
+                    <td class="mono">{{ r.ticket }}</td>
+                    <td>{{ r.decidedBy }}</td>
+                    <td>
+                      <div class="left-cell"><span>{{ r.removalPending ? 'ending' : remaining(r) }}</span>
+                        <div class="bar small"><span [style.width.%]="progress(r)"></span></div></div>
+                    </td>
+                    <td class="right">
+                      @if (r.actions.includes('revoke')) {
+                        <button class="btn danger small" (click)="act(r, 'revoke')" [disabled]="!!busy()">End now</button>
+                      }
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        } @else {
+          <p class="empty">Nobody has temporary access right now.</p>
+        }
+      </section>
+    }
+
+    <section class="card">
+      <h2>My requests</h2>
+      @if (mine().length) {
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Ticket</th><th>App</th><th>Status</th><th>Requested</th><th>Duration</th><th>Outcome</th><th></th></tr></thead>
+            <tbody>
+              @for (r of mine(); track r.id) {
+                <tr>
+                  <td class="mono">{{ r.ticket }}</td>
+                  <td>{{ r.app }}</td>
+                  <td><span class="badge" [class]="r.status">{{ r.status }}</span></td>
+                  <td>{{ when(r.createdAt) }}</td>
+                  <td>{{ dur(r.durationMinutes) }}</td>
+                  <td class="muted">{{ outcome(r) }}@if (r.status === 'active' && !r.removalPending) { · {{ remaining(r) }} }
+                    @if (r.decisionComment) { <div class="comment">“{{ r.decisionComment }}”</div> }</td>
+                  <td class="right nowrap">
+                    @if (r.actions.includes('cancel')) { <button class="btn small" (click)="act(r, 'cancel')" [disabled]="!!busy()">Withdraw</button> }
+                    @if (r.actions.includes('revoke')) { <button class="btn danger small" (click)="act(r, 'revoke')" [disabled]="!!busy()">End now</button> }
+                    <button class="btn ghost small" (click)="toggleHistory(r.id)">{{ openHistory() === r.id ? 'Hide' : 'History' }}</button>
+                  </td>
+                </tr>
+                @if (openHistory() === r.id) {
+                  <tr class="history-row"><td colspan="7">
+                    <ol class="history">
+                      @for (e of history(); track $index) {
+                        <li><span class="h-time">{{ when(e.at) }}</span><span class="h-action">{{ e.action }}</span>
+                          <span class="h-actor">{{ e.actor }}</span><span class="h-detail">{{ e.detail }}</span></li>
+                      }
+                    </ol>
+                  </td></tr>
+                }
+              }
+            </tbody>
+          </table>
+        </div>
+      } @else {
+        <p class="empty">No requests yet.</p>
+      }
+    </section>
+
+    @if (m.isApprover && recent().length) {
+      <section class="card">
+        <h2>Recent decisions</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Who</th><th>Ticket</th><th>Status</th><th>Decided by</th><th>Ended</th><th>Comment</th></tr></thead>
+            <tbody>
+              @for (r of recent(); track r.id) {
+                <tr>
+                  <td>{{ r.requester }}</td>
+                  <td class="mono">{{ r.ticket }}</td>
+                  <td><span class="badge" [class]="r.status">{{ r.status }}</span></td>
+                  <td>{{ r.decidedBy ?? '–' }}</td>
+                  <td>{{ when(r.endedAt ?? r.decidedAt) }}</td>
+                  <td class="muted">{{ r.decisionComment ?? r.endReason ?? '' }}</td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </section>
+    }
+  } @else {
+    <p class="empty">Loading…</p>
+  }
+</main>

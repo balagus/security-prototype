@@ -1,6 +1,6 @@
 # Security prototype
 
-Phase 0 (`compose.phase0.yaml`) is the insecure baseline. Phase 1 (`compose.phase1.yaml`) is the hardened version of the same stack; see "Phase 1: hardened stack" below. Phase 2 (`compose.phase2.yaml`) adds just-in-time developer access through OpenBao and Keycloak; see "Phase 2" below. Phase 3 (`compose.phase3.yaml`) moves developer access to read replicas and adds session sweepers; see "Phase 3" below. Phase 4 (`compose.phase4.yaml`) adds database audit logging, log shipping to a separate store and lab alert rules; see "Phase 4" below. Phase 5 (`compose.phase5.yaml`) adds debug telemetry (traces and logs in Grafana) for reproducing bugs without database access; see "Phase 5" below.
+Phase 0 (`compose.phase0.yaml`) is the insecure baseline. Phase 1 (`compose.phase1.yaml`) is the hardened version of the same stack; see "Phase 1: hardened stack" below. Phase 2 (`compose.phase2.yaml`) adds just-in-time developer access through OpenBao and Keycloak; see "Phase 2" below. Phase 3 (`compose.phase3.yaml`) moves developer access to read replicas and adds session sweepers; see "Phase 3" below. Phase 4 (`compose.phase4.yaml`) adds database audit logging, log shipping to a separate store and lab alert rules; see "Phase 4" below. Phase 5 (`compose.phase5.yaml`) adds debug telemetry (traces and logs in Grafana) for reproducing bugs without database access; see "Phase 5" below. Phase 6 (`compose.phase6.yaml`, an add-on to phase 5) adds the access approval portal; see "Phase 6" below.
 
 ## Phase 0
 
@@ -454,6 +454,75 @@ Remove-Item .\secrets\openbao_phase5_unseal_key, .\secrets\openbao_phase5_root_t
 ```
 
 `-v` also deletes the telemetry volumes (`loki-data`, `tempo-data`, `grafana-data`) along with the phase 4 volumes of this project. Keep `secrets\openbao_phase5_reconciler_role_id` and `_secret_id` for the same reason as in phase 4.
+
+## Phase 6: access approval portal
+
+`compose.phase6.yaml` is an add-on to phase 5 (design section 4.C, "Approval design"). It is always used together with `compose.phase5.yaml` and runs in the same project, so the phase 5 stack and its data stay as they are. It adds one container, `portal` (`apps/portal`): an ASP.NET Core 10 API with an Angular UI, on http://localhost:8090.
+
+How access works with the portal:
+
+1. A developer signs in to the portal through Keycloak and requests access to `app1`: ticket ID (`ABC-123` form), reason, duration (1 to 4 h).
+2. Someone in the Keycloak group `app1-approvers` approves or denies it. Nobody can approve their own request; a denial needs a comment.
+3. On approval the portal adds the developer to the Keycloak group `app1-devs`. OpenBao already maps that group to the read-only database roles (phase 2).
+4. The developer signs in to OpenBao personally and reads `database/creds/app1-pg-ro` or `app1-maria-ro`, as before. The portal has no OpenBao token and no database access.
+5. At expiry, or when the requester or an approver ends it early, the portal removes the membership (checked every 15 s here). Failed removals are retried and alerted.
+6. Drift check: any `app1-devs` member who has no approved, active grant is removed and raises an alert. LAB-ONLY: `alice` stays a standing member, because the phase 2 to 5 tests rely on her.
+
+What else it adds:
+
+- Keycloak, configured by `scripts/phase6-setup.ps1` through the admin API (the realm seed file is unchanged): group `app1-approvers`, LAB-ONLY approver `carol`, client `portal` (confidential, code flow, PKCE S256; .NET 10 sends the authorization request by PAR), and client `portal-group-manager`.
+- `portal-group-manager` is the service account that changes memberships. Fine-grained admin permissions (v2) let it add and remove members of `app1-devs` only. It also holds the read-only role `view-users`. Measured on Keycloak 26.8.2: with only resource-scoped permissions, the group search and group member endpoints return empty lists. Every other write is refused: other groups, password resets, profile changes, new users, role mappings, clients, realm settings (`tests\phase6-checks.ps1`, section 7).
+- Audit: each portal action is one JSON line in the `portal-log` volume (mode 0640, group 4000). Fluent Bit ships it to `log-store` with the database and OpenBao records (`config/fluent-bit/phase6/fluent-bit.conf`, `normalize_portal` in `config/fluent-bit/audit.lua`). Records carry the ticket, requester, approver (`user`), group and expiry. New alerts: `portal_self_approval`, `portal_approval_refused`, `portal_membership_drift`, `portal_grant_membership_missing`, `portal_keycloak_error`.
+- Isolation: the portal is on `portal-edge` (published port only) and `portal-idp` (internal, Keycloak only). It cannot reach OpenBao or any database. It runs as uid 1654 with a read-only root filesystem and no capabilities, on 127.0.0.1 only. Its state is SQLite on `portal-data`.
+- Requests to the API need a session cookie (`SameSite=Lax`, 30 min, groups as of sign-in). Every state change also needs the header `X-Portal-Request: 1`, the CSRF guard.
+
+LAB-ONLY shortcuts, do not copy to production:
+
+- Minimum duration is 1 minute so the tests can watch an expiry. Production: 60 (`Portal__MinDurationMinutes`).
+- `Portal__AcceptBearer=true` and the Keycloak client `portal-test` (password grant, audience `portal`) let the tests call the API without a browser.
+- `alice` is a standing member of `app1-devs` (`Portal__StandingMembers__0`).
+- Keycloak runs over plain HTTP, so the portal also uses HTTP and non-`Secure` cookies.
+- `carol`'s password is in `secrets\keycloak_carol_password`.
+
+### Start and set up
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\gen-secrets.ps1
+docker compose -f compose.phase5.yaml -f compose.phase6.yaml up -d --build
+powershell -ExecutionPolicy Bypass -File .\scripts\phase6-setup.ps1
+```
+
+`gen-secrets.ps1` writes three new files: the two client secrets and carol's password. `phase6-setup.ps1` runs `phase5-setup.ps1` first (`-SkipPhase5` skips it). It then attaches the running Keycloak container to `portal-idp`, writes the Keycloak configuration and waits for the portal's `/readyz`. It is idempotent. Run it again whenever Keycloak was recreated.
+
+The add-on does not redefine Keycloak on purpose. Keycloak runs in dev mode with its database inside the container, so a recreated container re-imports the realm with **new user IDs**. Grafana (phase 5) stores the Keycloak user ID at the first sign-in, so after a re-import `alice` can no longer sign in to Grafana ("unable to create user: user not found"). This was measured during the build. The repair is to delete the stale Grafana users (`grafana-data`). The phase 6 tests do not depend on Grafana.
+
+### Test
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\phase6-checks.ps1
+```
+
+It takes about three minutes. It covers the sign-in surface, input rules, approval rules, the OpenBao effect of a grant, revocation, denial, expiry, drift, the service account's limits, container isolation, the audit trail in `log-store`, and a restart.
+
+Measured on 2026-11-23: `phase6-checks.ps1` 83 of 83 on the phase 5 + 6 stack, in two runs. Approval to working OpenBao credentials took 2.3 to 2.6 s. The membership was gone 4.9 to 8.3 s after expiry, and 12.7 to 13.7 s after an out-of-band add (drift). On the same stack, with the phase 6 Fluent Bit configuration: `smoke.ps1 -Phase 1` 13 of 13, `phase4-checks.ps1` 96 of 96. `phase5-checks.ps1` was 24 of 27 at first: the three Grafana sign-in checks for `alice` failed because of the Keycloak re-import described above, which the current add-on no longer causes. After the stale Grafana users were deleted it passed 27 of 27. The portal uses about 45 MiB.
+
+What revocation does and does not do in OpenBao (measured):
+
+- Right after the membership is removed, an OpenBao token the developer already holds still reads credentials. `bao token renew` does not change that (a jwt token renewal does not re-read the groups).
+- The developer's next OpenBao login cuts **all** of their tokens. The external group membership belongs to their OpenBao entity, and policies are evaluated per request.
+- Database credentials already issued are not revoked by the portal. They live until their lease TTL (1 h default, 4 h max) or until the token is revoked. The sweepers and the reconciler (phases 3 and 4) work as before.
+
+### Try it in a browser
+
+Open http://localhost:8090 and sign in as `bob` (password in `config\keycloak\phase5\lab-realm.json`) to request access. Then use a private window, sign in as `carol` (`secrets\keycloak_carol_password`) and approve it. The portal shows bob the remaining time and the OpenBao paths to read. Each request has a history of its steps.
+
+### Back to plain phase 5
+
+```powershell
+docker compose -f compose.phase5.yaml up -d --remove-orphans
+```
+
+`docker compose -f compose.phase5.yaml -f compose.phase6.yaml down -v` deletes the phase 5 volumes too.
 
 ## Memory on an 8 GB host
 
