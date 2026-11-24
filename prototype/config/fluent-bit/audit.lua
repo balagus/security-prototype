@@ -46,6 +46,12 @@
 --                          descriptor directory is unreadable, or a rewrite/reload failed
 --   pg_server_process_crashed the postmaster saw a child die abnormally and restarted every
 --                          session (also what killing the watcher's supervisor with SIGKILL does)
+-- Phase 6b, developer write path (temp users of the OpenBao role app1-pg-rw, on pg-primary):
+--   write_access_login     a write session logged in (every one is reviewed against its ticket)
+--   write_access_statement a write session ran a WRITE statement (pgAudit record; replaces
+--                          temp_user_write for these users)
+--   (no alert)             event "row_change": one row changed by a temp user, with old and new
+--                          values, from the trigger dev_audit.capture() ("DEV_CHANGE: {json}")
 
 -- Accounts allowed to log in, per engine (temp users "v-..." are always allowed).
 local ALLOW = {
@@ -83,6 +89,9 @@ local WRITE_WORDS = {
 }
 
 local function is_temp(u) return type(u) == "string" and u:sub(1, 2) == "v-" end
+-- Phase 6b: temp users of the OpenBao WRITE role app1-pg-rw (username template
+-- "v-<display name>-<role name>-<time>-<random>"). They exist only on pg-primary.
+local function is_write_user(u) return is_temp(u) and u:find("-app1-pg-rw-", 3, true) ~= nil end
 
 local function first_word(stmt)
   if type(stmt) ~= "string" then return nil end
@@ -158,7 +167,7 @@ local function parse_pgaudit(msg)
     pos = c + 1
   end
   local rest = s:sub(pos)
-  local stmt
+  local stmt, rows
   if rest:sub(1, 1) == '"' then
     local buf = {}
     local i = 2
@@ -178,12 +187,17 @@ local function parse_pgaudit(msg)
       end
     end
     stmt = table.concat(buf)
+    -- After the statement: ",<parameter>" and, with pgaudit.log_rows (phase 6b write sessions),
+    -- ",<rows>".
+    rows = rest:sub(i + 1):match(",(%d+)$")
   else
-    local last = rest:match(".*(),")
-    if last then stmt = rest:sub(1, last - 1) else stmt = rest end
+    -- Unquoted: pgAudit quotes every statement that contains a comma, so this one ends at the
+    -- first comma. Then ",<parameter>" and, with log_rows, ",<rows>".
+    stmt = rest:match("^([^,]*)")
+    rows = rest:match("^[^,]*,<[%a ]+>,(%d+)$")
   end
   return { audit_type = f[1], statement_id = f[2], substatement_id = f[3], class = f[4],
-           command = f[5], object_type = f[6], object_name = f[7] }, stmt
+           command = f[5], object_type = f[6], object_name = f[7], rows = rows }, stmt
 end
 
 local function pg_time(ts)
@@ -216,14 +230,27 @@ local function normalize_pg(source, r)
       out.audit_class = a.class
       out.audit_command = a.command
       out.audit_object = (a.object_name ~= "" and a.object_name) or nil
+      out.audit_rows = a.rows
       out.statement = stmt
     else
       out.event = "audit"
       out.message = msg
     end
-    if is_temp(out.user) and a and (a.class == "WRITE" or a.class == "DDL" or a.class == "ROLE") then
+    if is_write_user(out.user) and a and a.class == "WRITE" then
+      -- Phase 6b: an approved write session changed data. Expected, but every one is reviewed.
+      set_alert(out, "write_access_statement", "write session " .. tostring(out.user) .. " ran " .. tostring(a.command))
+    elseif is_temp(out.user) and a and (a.class == "WRITE" or a.class == "DDL" or a.class == "ROLE") then
       set_alert(out, "temp_user_write", "temporary user ran a " .. a.class .. " statement")
     end
+  elseif msg:sub(1, 12) == "DEV_CHANGE: " then
+    -- Phase 6b: one row changed by a developer temp user (trigger dev_audit.capture() on the
+    -- primary). The JSON is kept as text: db_user, txid, pid, table, op, old, new.
+    out.event = "row_change"
+    out.row_change = msg:sub(13)
+    out.audit_object = out.row_change:match('"table"%s*:%s*"([^"]+)"')
+    out.audit_command = out.row_change:match('"op"%s*:%s*"([^"]+)"')
+    out.txid = out.row_change:match('"txid"%s*:%s*(%d+)')
+    out.user = out.row_change:match('"db_user"%s*:%s*"([^"]+)"') or out.user
   elseif msg:find("^connection authorized: ") or msg:find("^replication connection authorized: ") then
     out.event = "login"
     out.user = out.user or msg:match("user=(%S+)")
@@ -256,6 +283,9 @@ local function normalize_pg(source, r)
     out.detail = r["detail"]
   end
   login_rules(out, "postgresql")
+  if out.event == "login" and is_write_user(out.user) then
+    set_alert(out, "write_access_login", "write session opened on " .. tostring(source) .. " by " .. tostring(out.user))
+  end
   -- The postmaster logs this (LOG) only for an ABNORMAL child exit, before it terminates every
   -- other session and reinitializes.
   if msg:find("^server process %(PID %d+%) ") and (msg:find("was terminated by", 1, true)

@@ -181,22 +181,28 @@ Caller Who(HttpContext ctx)
     var sub = u.FindFirstValue("sub") ?? throw new InvalidOperationException("token without sub");
     var username = u.FindFirstValue("preferred_username") ?? sub;
     var name = u.FindFirstValue("name") ?? username;
-    var approver = u.FindAll("groups").Any(c => c.Value == opts.ApproverGroup || c.Value == "/" + opts.ApproverGroup);
-    return new Caller(sub, username, name, approver, ctx.Connection.RemoteIpAddress?.ToString());
+    var groups = u.FindAll("groups").Select(c => c.Value.TrimStart('/')).ToHashSet(StringComparer.Ordinal);
+    return new Caller(sub, username, name, groups, ctx.Connection.RemoteIpAddress?.ToString());
 }
 
 IResult Send(Outcome o) => Results.Json(o.Body, statusCode: o.Status);
 
-api.MapGet("/me", (HttpContext ctx) =>
+api.MapGet("/me", (HttpContext ctx, AccessService svc) =>
 {
     var c = Who(ctx);
     return Results.Ok(new
     {
         username = c.Username,
         name = c.DisplayName,
-        isApprover = c.IsApprover,
+        isApprover = svc.ApprovesAny(c),
         approverGroup = opts.ApproverGroup,
-        apps = opts.Apps.Select(a => new { a.Id, a.Name, a.Description, a.Group }),
+        apps = opts.Apps.Select(a => new
+        {
+            a.Id, a.Name, a.Description, a.Group,
+            approverGroup = opts.ApproverGroupOf(a),
+            maxDurationMinutes = opts.MaxDurationOf(a),
+            isApprover = c.Groups.Contains(opts.ApproverGroupOf(a)),
+        }),
         minDurationMinutes = opts.MinDurationMinutes,
         maxDurationMinutes = opts.MaxDurationMinutes,
         ticketExample = "OPS-1234",
@@ -207,7 +213,7 @@ api.MapGet("/requests", (HttpContext ctx, AccessService svc, string? scope) =>
 {
     var c = Who(ctx);
     if (scope == "all")
-        return c.IsApprover ? Results.Ok(svc.All(c)) : Results.Json(new { error = "approvers only" }, statusCode: 403);
+        return svc.ApprovesAny(c) ? Results.Ok(svc.All(c)) : Results.Json(new { error = "approvers only" }, statusCode: 403);
     return Results.Ok(svc.Mine(c));
 });
 

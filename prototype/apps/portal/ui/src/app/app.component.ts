@@ -2,7 +2,7 @@ import { Component, DestroyRef, computed, inject, signal } from '@angular/core';
 import { HttpClient, HttpErrorResponse, HttpHeaders } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 
-interface AppEntry { id: string; name: string; description: string; group: string; }
+interface AppEntry { id: string; name: string; description: string; group: string; approverGroup: string; maxDurationMinutes: number; isApprover: boolean; }
 
 interface Me {
   username: string;
@@ -77,8 +77,17 @@ export class AppComponent {
     const opts = new Set<number>();
     if (m.minDurationMinutes < 60) [m.minDurationMinutes, 5, 15, 30].forEach((d) => opts.add(d));
     [60, 120, 180, 240].forEach((d) => opts.add(d));
-    return [...opts].filter((d) => d >= m.minDurationMinutes && d <= m.maxDurationMinutes).sort((a, b) => a - b);
+    const max = this.selectedApp()?.maxDurationMinutes ?? m.maxDurationMinutes;
+    return [...opts].filter((d) => d >= m.minDurationMinutes && d <= max).sort((a, b) => a - b);
   });
+
+  readonly selectedApp = computed(() => this.me()?.apps.find((a) => a.id === this.fApp()) ?? null);
+
+  // The write app allows shorter grants than the read app: keep the chosen duration valid.
+  clampDuration() {
+    const d = this.durations();
+    if (d.length && !d.includes(this.fDuration())) this.fDuration.set(d.filter((x) => x <= this.fDuration()).pop() ?? d[0]);
+  }
 
   readonly openForApp = computed(() => this.mine().find((r) => r.app === this.fApp() && (r.status === 'pending' || r.status === 'active')) ?? null);
   readonly pendingForMe = computed(() => this.all().filter((r) => r.status === 'pending' && !r.mine));
