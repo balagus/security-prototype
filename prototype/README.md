@@ -1,6 +1,6 @@
 # Security prototype
 
-Phase 0 (`compose.phase0.yaml`) is the insecure baseline. Phase 1 (`compose.phase1.yaml`) is the hardened version of the same stack; see "Phase 1: hardened stack" below. Phase 2 (`compose.phase2.yaml`) adds just-in-time developer access through OpenBao and Keycloak; see "Phase 2" below. Phase 3 (`compose.phase3.yaml`) moves developer access to read replicas and adds session sweepers; see "Phase 3" below. Phase 4 (`compose.phase4.yaml`) adds database audit logging, log shipping to a separate store and lab alert rules; see "Phase 4" below. Phase 5 (`compose.phase5.yaml`) adds debug telemetry (traces and logs in Grafana) for reproducing bugs without database access; see "Phase 5" below. Phase 6 (`compose.phase6.yaml`, an add-on to phase 5) adds the access approval portal; see "Phase 6" below.
+Phase 0 (`compose.phase0.yaml`) is the insecure baseline. Phase 1 (`compose.phase1.yaml`) is the hardened version of the same stack; see "Phase 1: hardened stack" below. Phase 2 (`compose.phase2.yaml`) adds just-in-time developer access through OpenBao and Keycloak; see "Phase 2" below. Phase 3 (`compose.phase3.yaml`) moves developer access to read replicas and adds session sweepers; see "Phase 3" below. Phase 4 (`compose.phase4.yaml`) adds database audit logging, log shipping to a separate store and lab alert rules; see "Phase 4" below. Phase 5 (`compose.phase5.yaml`) adds debug telemetry (traces and logs in Grafana) for reproducing bugs without database access; see "Phase 5" below. Phase 6 (`compose.phase6.yaml`, an add-on to phase 5) adds the access approval portal and the audited developer write path on PostgreSQL; see "Phase 6" below.
 
 ## Phase 0
 
@@ -480,9 +480,9 @@ LAB-ONLY shortcuts, do not copy to production:
 
 - Minimum duration is 1 minute so the tests can watch an expiry. Production: 60 (`Portal__MinDurationMinutes`).
 - `Portal__AcceptBearer=true` and the Keycloak client `portal-test` (password grant, audience `portal`) let the tests call the API without a browser.
-- `alice` is a standing member of `app1-devs` (`Portal__StandingMembers__0`).
+- `alice` is a standing member of `app1-devs` (`Portal__Apps__0__StandingMembers__0`). She has no standing write access.
 - Keycloak runs over plain HTTP, so the portal also uses HTTP and non-`Secure` cookies.
-- `carol`'s password is in `secrets\keycloak_carol_password`.
+- `carol`'s password is in `secrets\keycloak_carol_password`, `dave`'s in `secrets\keycloak_dave_password`.
 
 ### Start and set up
 
@@ -492,7 +492,7 @@ docker compose -f compose.phase5.yaml -f compose.phase6.yaml up -d --build
 powershell -ExecutionPolicy Bypass -File .\scripts\phase6-setup.ps1
 ```
 
-`gen-secrets.ps1` writes three new files: the two client secrets and carol's password. `phase6-setup.ps1` runs `phase5-setup.ps1` first (`-SkipPhase5` skips it). It then attaches the running Keycloak container to `portal-idp`, writes the Keycloak configuration and waits for the portal's `/readyz`. It is idempotent. Run it again whenever Keycloak was recreated.
+`gen-secrets.ps1` writes four new files: the two client secrets and the passwords of carol and dave. `phase6-setup.ps1` runs `phase5-setup.ps1` first (`-SkipPhase5` skips it). It then attaches the running Keycloak container to `portal-idp`, writes the Keycloak configuration and waits for the portal's `/readyz`. It is idempotent. Run it again whenever Keycloak was recreated.
 
 The add-on does not redefine Keycloak on purpose. Keycloak runs in dev mode with its database inside the container, so a recreated container re-imports the realm with **new user IDs**. Grafana (phase 5) stores the Keycloak user ID at the first sign-in, so after a re-import `alice` can no longer sign in to Grafana ("unable to create user: user not found"). This was measured during the build. The repair is to delete the stale Grafana users (`grafana-data`). The phase 6 tests do not depend on Grafana.
 
@@ -512,6 +512,43 @@ What revocation does and does not do in OpenBao (measured):
 - The developer's next OpenBao login cuts **all** of their tokens. The external group membership belongs to their OpenBao entity, and policies are evaluated per request.
 - Database credentials already issued are not revoked by the portal. They live until their lease TTL (1 h default, 4 h max) or until the token is revoked. The sweepers and the reconciler (phases 3 and 4) work as before.
 
+### Write access (phase 6b)
+
+The same add-on also builds the developer **write** path on PostgreSQL (design 4.C, "Write and break-glass path"). The preferred route for a data fix is still a reviewed migration. This path is for when that is too slow.
+
+How it works:
+
+1. The developer requests the portal app `app1-write` (at most 60 min). Only a member of `app1-write-approvers` may approve it (LAB-ONLY: `dave`), never the requester. Members of `app1-approvers` (carol) can neither approve nor see write requests.
+2. The portal adds the developer to the Keycloak group `app1-devs-rw`. OpenBao maps it to the policy `app1-write` (`config/openbao/app1-write.hcl`), which allows only `database/creds/app1-pg-rw`.
+3. That OpenBao role creates the temp user **on the primary**: 30-minute lease (renewal cannot extend it), one session at a time, member of `debug_rw`. `debug_rw` has SELECT, INSERT, UPDATE and DELETE on `public.customers` and `public.orders`, nothing else: no TRUNCATE, no DDL, no masked views, no other database. UPDATE and DELETE with a WHERE clause need SELECT, so this path sees the unmasked data of those tables.
+4. The developer connects to `pg-primary` from the internal network `rw-access` (10.81.15.0/24). `pg_hba` on the primary allows `+debug_rw` only from there, only to `app1`, only over TLS. The replica refuses write users (they are not in `debug_ro`). Read users are still refused on the primary, and the read network `access` cannot reach the primary at all.
+
+Every write session is audited three ways, and all three reach `log-store`:
+
+- **pgAudit on the temp role itself.** OpenBao's creation statements call `dev_audit.enable_session_audit('<user>')`, which sets `pgaudit.log = 'read, write, ddl, role, function, misc'`, `log_relation`, `log_parameter` and `log_rows` on that role. A setting on `debug_rw` would not reach its members (phase 4). The function is SECURITY DEFINER, owned by `postgres`, executable only by `bao_admin`, and refuses anything that is not an existing `v-` login role in `debug_rw`. If it fails, OpenBao issues no credentials. `bao_admin` gets no SET privilege on `pgaudit.*`.
+- **Row trigger `zz_dev_audit`** on both tables (`dev_audit.capture()`). For a session whose login role starts with `v-`, it writes the old and new row to `dev_audit.row_changes` (same transaction, so a rollback removes it) and a `DEV_CHANGE: {json}` line to the server log. The application's own writes return after one comparison. Only the NOLOGIN role `audit_owner` can read or write `dev_audit`.
+- **The login and every write statement raise an alert:** `write_access_login` and `write_access_statement`. The trigger's lines become `event: row_change` records with `row_change` (the JSON), `audit_object`, `audit_command` and `txid`. pgAudit records now also carry `audit_rows`.
+
+A write user cannot turn any of this off. These are refused (tested): `SET pgaudit.log`, `ALTER ROLE ... SET`, `SET session_replication_role`, `SET log_min_messages`, `ALTER TABLE ... DISABLE TRIGGER`, reading or deleting `dev_audit.row_changes`, calling `enable_session_audit`, and `SET ROLE app1_runtime`.
+
+Set up by `scripts/phase6-setup.ps1`. It runs `config/postgres/phase6-write-access.sh` on the primary, writes the OpenBao role, policy and identity groups, and creates the Keycloak groups and `dave`. Because `pg-primary` gets a new network and `pg_hba` file, the add-on recreates it; its data volume stays. Run the setup again after any migration that recreates `customers` or `orders`, since a dropped table loses its trigger.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\phase6-write-checks.ps1
+```
+
+It takes about two minutes and covers the database objects, the guard function, the portal rules, the OpenBao policy and lease, `pg_hba` and the networks, the refusals, the row audit, the audit store and alerts, the session limit and revocation.
+
+Measured on 2026-11-24 on the phase 5 + 6 stack: `phase6-write-checks.ps1` 58 of 58. On the same stack: `smoke.ps1` 13 of 13, `phase6-checks.ps1` 83 of 83, `phase5-checks.ps1` 27 of 27, and `phase4-checks.ps1` (with `-ComposeFile .\compose.phase5.yaml -Project security-prototype-phase5 -BaoSecretPrefix openbao_phase5`) 95 of 96. Its one failure is the known dropped host-to-container requests on port 8080 (proposal 7.5). `phase3-checks.ps1` would now report the primary's `pg_hba` as changed; that change is intended.
+
+Known limits:
+
+- **The audit store now holds the changed rows.** For `customers` that includes unmasked e-mail addresses and names. That is the point of the audit, but the store's access and retention must allow it.
+- **The removal delay from 4.C applies here too, and matters more.** For up to the OpenBao token TTL (4 h max) after the grant ends, a token issued before can still mint new 30-minute write credentials, until the developer logs in again. Closing this needs the portal to revoke the person's tokens in OpenBao (not built).
+- The `DEV_CHANGE` log line is written even when the transaction rolls back. The `txid` field joins it to `dev_audit.row_changes`, which only holds committed changes.
+- MariaDB has no write path. Its temp users live on the replica only (phase 4, binary-log password leak), so a MariaDB write path needs its own design.
+- A superuser can still disable the trigger or pgAudit. The `superuser_login` alert is the only control for that, as before.
+
 ### Try it in a browser
 
 Open http://localhost:8090 and sign in as `bob` (password in `config\keycloak\phase5\lab-realm.json`) to request access. Then use a private window, sign in as `carol` (`secrets\keycloak_carol_password`) and approve it. The portal shows bob the remaining time and the OpenBao paths to read. Each request has a history of its steps.
@@ -521,6 +558,8 @@ Open http://localhost:8090 and sign in as `bob` (password in `config\keycloak\ph
 ```powershell
 docker compose -f compose.phase5.yaml up -d --remove-orphans
 ```
+
+This recreates `pg-primary` with the phase 5 `pg_hba` file, which refuses write users. `debug_rw`, `dev_audit` and the triggers stay in the database. They do nothing without write users.
 
 `docker compose -f compose.phase5.yaml -f compose.phase6.yaml down -v` deletes the phase 5 volumes too.
 

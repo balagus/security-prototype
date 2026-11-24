@@ -22,13 +22,14 @@ public sealed class PortalOptions
     public string GroupManagerSecretFile { get; set; } = "/run/secrets/portal_group_manager_secret";
 
     // Members of this Keycloak group may approve, deny and revoke. Never their own requests.
+    // Default for every app without its own ApproverGroup.
     public string ApproverGroup { get; set; } = "app1-approvers";
 
     public List<AppEntry> Apps { get; set; } = new();
 
-    // Users who are permanent members of a managed group and are left alone by the drift check.
-    // Production: empty. LAB-ONLY: "alice" (the phase 2 to 5 tests rely on her membership).
-    public List<string> StandingMembers { get; set; } = new();
+    public string ApproverGroupOf(AppEntry a) => string.IsNullOrWhiteSpace(a.ApproverGroup) ? ApproverGroup : a.ApproverGroup;
+    public int MaxDurationOf(AppEntry a) => a.MaxDurationMinutes is int m && m > 0 ? Math.Min(m, MaxDurationMinutes) : MaxDurationMinutes;
+    public AppEntry? App(string? id) => Apps.FirstOrDefault(a => a.Id == id);
 
     public int MinDurationMinutes { get; set; } = 60;
     public int MaxDurationMinutes { get; set; } = 240;
@@ -70,6 +71,15 @@ public sealed class AppEntry
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
     public string Description { get; set; } = "";
-    // Keycloak group that OpenBao maps to the app's read-only database roles.
+    // Keycloak group that OpenBao maps to the app's database roles.
     public string Group { get; set; } = "";
+    // Phase 6b: who may decide requests for this app. Empty = PortalOptions.ApproverGroup. The
+    // write path uses its own, smaller group (app1-write-approvers).
+    public string ApproverGroup { get; set; } = "";
+    // Upper bound for this app (never above PortalOptions.MaxDurationMinutes). Null = global.
+    public int? MaxDurationMinutes { get; set; }
+    // Users who are permanent members of this app's group and are left alone by the drift
+    // check. Production: empty. LAB-ONLY: "alice" in app1-devs (the phase 2 to 5 tests rely on
+    // her membership); nobody in app1-devs-rw.
+    public List<string> StandingMembers { get; set; } = new();
 }

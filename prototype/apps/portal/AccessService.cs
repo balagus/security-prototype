@@ -2,7 +2,8 @@ using System.Text.RegularExpressions;
 
 namespace Portal;
 
-public sealed record Caller(string Sub, string Username, string DisplayName, bool IsApprover, string? Ip);
+// Groups: the caller's Keycloak groups (token claim "groups", without a leading "/").
+public sealed record Caller(string Sub, string Username, string DisplayName, IReadOnlySet<string> Groups, string? Ip);
 
 public sealed record Outcome(int Status, object Body)
 {
@@ -37,7 +38,13 @@ public sealed class AccessService
         _ticket = new Regex(o.TicketPattern, RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
     }
 
-    private bool IsStanding(string username) => _o.StandingMembers.Contains(username, StringComparer.OrdinalIgnoreCase);
+    private bool IsStanding(string group, string username) =>
+        _o.Apps.Where(a => a.Group == group).Any(a => a.StandingMembers.Contains(username, StringComparer.OrdinalIgnoreCase));
+
+    // Approver rights are per app (phase 6b: the write app has its own approver group).
+    private string ApproverGroupOf(string appId) => _o.App(appId) is AppEntry a ? _o.ApproverGroupOf(a) : _o.ApproverGroup;
+    private bool Approves(Caller c, string appId) => c.Groups.Contains(ApproverGroupOf(appId));
+    public bool ApprovesAny(Caller c) => _o.Apps.Any(a => Approves(c, a.Id));
 
     private static bool IsDue(AccessRequest r, DateTimeOffset now) =>
         r.Status == Status.Active && (r.EndKind is not null || r.ExpiresAt <= now);
@@ -62,14 +69,15 @@ public sealed class AccessService
 
     public async Task<Outcome> Create(Caller c, CreateBody b, CancellationToken ct)
     {
-        var app = _o.Apps.FirstOrDefault(a => a.Id == b.App);
+        var app = _o.App(b.App);
         if (app is null) return Outcome.Error(400, "unknown app");
+        var maxDur = _o.MaxDurationOf(app);
         var ticket = (b.Ticket ?? "").Trim().ToUpperInvariant();
         if (!_ticket.IsMatch(ticket)) return Outcome.Error(400, "ticket must look like ABC-123");
         var reason = (b.Reason ?? "").Trim();
         if (reason.Length < 10 || reason.Length > 500) return Outcome.Error(400, "reason must be 10 to 500 characters");
-        if (b.DurationMinutes is not int dur || dur < _o.MinDurationMinutes || dur > _o.MaxDurationMinutes)
-            return Outcome.Error(400, $"duration must be {_o.MinDurationMinutes} to {_o.MaxDurationMinutes} minutes");
+        if (b.DurationMinutes is not int dur || dur < _o.MinDurationMinutes || dur > maxDur)
+            return Outcome.Error(400, $"duration must be {_o.MinDurationMinutes} to {maxDur} minutes");
 
         var r = new AccessRequest
         {
@@ -79,7 +87,7 @@ public sealed class AccessService
             Status = Status.Pending, CreatedAt = DateTimeOffset.UtcNow,
         };
 
-        if (IsStanding(c.Username))
+        if (IsStanding(app.Group, c.Username))
         {
             _audit.Write(Entry("request-refused", c, r, "refused", "requester has standing access"));
             return Outcome.Error(409, $"you already have standing access to {app.Id}");
@@ -118,10 +126,10 @@ public sealed class AccessService
         {
             var r = _store.Get(id);
             if (r is null) return Outcome.Error(404, "no such request");
-            if (!c.IsApprover)
+            if (!Approves(c, r.App))
             {
-                _audit.Write(Entry("approval-refused", c, r, "refused", "caller is not in " + _o.ApproverGroup));
-                return Outcome.Error(403, "only members of " + _o.ApproverGroup + " can approve");
+                _audit.Write(Entry("approval-refused", c, r, "refused", "caller is not in " + ApproverGroupOf(r.App)));
+                return Outcome.Error(403, "only members of " + ApproverGroupOf(r.App) + " can approve");
             }
             if (r.RequesterSub == c.Sub)
             {
@@ -157,10 +165,10 @@ public sealed class AccessService
         {
             var r = _store.Get(id);
             if (r is null) return Outcome.Error(404, "no such request");
-            if (!c.IsApprover)
+            if (!Approves(c, r.App))
             {
-                _audit.Write(Entry("approval-refused", c, r, "refused", "caller is not in " + _o.ApproverGroup));
-                return Outcome.Error(403, "only members of " + _o.ApproverGroup + " can deny");
+                _audit.Write(Entry("approval-refused", c, r, "refused", "caller is not in " + ApproverGroupOf(r.App)));
+                return Outcome.Error(403, "only members of " + ApproverGroupOf(r.App) + " can deny");
             }
             if (r.Status != Status.Pending) return Outcome.Error(409, $"request is {r.Status}");
             var comment = Clip(b.Comment);
@@ -196,7 +204,7 @@ public sealed class AccessService
         try
         {
             var r = _store.Get(id);
-            if (r is null || (r.RequesterSub != c.Sub && !c.IsApprover)) return Outcome.Error(404, "no such request");
+            if (r is null || (r.RequesterSub != c.Sub && !Approves(c, r.App))) return Outcome.Error(404, "no such request");
             if (r.Status != Status.Active) return Outcome.Error(409, $"request is {r.Status}");
             if (r.EndKind is null)
             {
@@ -269,7 +277,7 @@ public sealed class AccessService
                 {
                     var key = group + "|" + m.Id;
                     seen.Add(key);
-                    if (IsStanding(m.Username) || grantedSubs.Contains(m.Id)) { _reported.Remove(key); continue; }
+                    if (IsStanding(group, m.Username) || grantedSubs.Contains(m.Id)) { _reported.Remove(key); continue; }
                     var remove = string.Equals(_o.DriftAction, "remove", StringComparison.OrdinalIgnoreCase);
                     if (!_reported.Contains(key) || remove)
                     {
@@ -319,12 +327,13 @@ public sealed class AccessService
 
     public object Mine(Caller c) => _store.ByRequester(c.Sub).Select(r => ToDto(r, c)).ToList();
 
-    public object All(Caller c) => _store.Recent().Select(r => ToDto(r, c)).ToList();
+    // Approvers see the requests of the apps they decide.
+    public object All(Caller c) => _store.Recent().Where(r => Approves(c, r.App)).Select(r => ToDto(r, c)).ToList();
 
     public Outcome History(string id, Caller c)
     {
         var r = _store.Get(id);
-        if (r is null || (r.RequesterSub != c.Sub && !c.IsApprover)) return Outcome.Error(404, "no such request");
+        if (r is null || (r.RequesterSub != c.Sub && !Approves(c, r.App))) return Outcome.Error(404, "no such request");
         return new Outcome(200, _store.Events(id).Select(e => new { at = e.At, actor = e.Actor, action = e.Action, detail = e.Detail }));
     }
 
@@ -334,8 +343,9 @@ public sealed class AccessService
         var mine = r.RequesterSub == c.Sub;
         var actions = new List<string>();
         if (r.Status == Status.Pending && mine) actions.Add("cancel");
-        if (r.Status == Status.Pending && c.IsApprover && !mine) { actions.Add("approve"); actions.Add("deny"); }
-        if (r.Status == Status.Active && r.EndKind is null && (mine || c.IsApprover)) actions.Add("revoke");
+        var approver = Approves(c, r.App);
+        if (r.Status == Status.Pending && approver && !mine) { actions.Add("approve"); actions.Add("deny"); }
+        if (r.Status == Status.Active && r.EndKind is null && (mine || approver)) actions.Add("revoke");
         return new
         {
             id = r.Id, app = r.App, group = r.Group, requester = r.Requester, mine,

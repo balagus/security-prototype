@@ -44,19 +44,25 @@
               <span class="left">{{ remaining(a) }}</span>
             </div>
             <div class="bar"><span [style.width.%]="progress(a)"></span></div>
-            <p class="hint">You are in <span class="mono">{{ a.group }}</span>. Sign in to OpenBao again to pick it up, then read
-              <span class="mono">database/creds/app1-pg-ro</span> or <span class="mono">database/creds/app1-maria-ro</span>.</p>
+            @if (a.app === 'app1-write') {
+              <p class="hint">You are in <span class="mono">{{ a.group }}</span>. Sign in to OpenBao again to pick it up, then read
+                <span class="mono">database/creds/app1-pg-rw</span> (30 minutes) and connect to the PostgreSQL primary from the write network.
+                Every statement and every changed row is audited.</p>
+            } @else {
+              <p class="hint">You are in <span class="mono">{{ a.group }}</span>. Sign in to OpenBao again to pick it up, then read
+                <span class="mono">database/creds/app1-pg-ro</span> or <span class="mono">database/creds/app1-maria-ro</span>.</p>
+            }
           </div>
         }
         <form (submit)="submit($event)" novalidate>
           <label>
             <span>Application</span>
-            <select [value]="fApp()" (change)="fApp.set(value($event))">
+            <select [value]="fApp()" (change)="fApp.set(value($event)); clampDuration()">
               @for (a of m.apps; track a.id) { <option [value]="a.id">{{ a.name }}</option> }
             </select>
           </label>
           @for (a of m.apps; track a.id) {
-            @if (a.id === fApp()) { <p class="hint">{{ a.description }}</p> }
+            @if (a.id === fApp()) { <p class="hint">{{ a.description }} Approver group: <span class="mono">{{ a.approverGroup }}</span>.</p> }
           }
           <div class="row">
             <label class="grow">
@@ -89,7 +95,7 @@
         <h2>How it works</h2>
         <ol>
           <li><strong>Request</strong> with a ticket and a reason.</li>
-          <li><strong>Approval</strong> by someone in <span class="mono">{{ m.approverGroup }}</span>, never yourself.</li>
+          <li><strong>Approval</strong> by someone in the app's approver group (<span class="mono">{{ selectedApp()?.approverGroup ?? m.approverGroup }}</span>), never yourself.</li>
           <li>The portal adds you to the Keycloak group of the app until the grant expires.</li>
           <li>You sign in to <strong>OpenBao</strong> yourself and read short-lived, read-only credentials for the replicas.</li>
           <li>At expiry the membership is removed. OpenBao tokens you already hold keep working until their own TTL.</li>

@@ -34,9 +34,27 @@
 #   - Volumes: portal-data (SQLite request store, cookie keys; owner 1654, 0700) and portal-log
 #     (owner 1654, group 4000, 2750, the phase 4 log-reader model), prepared by portal-init.
 #
+#
+# Phase 6b: the developer WRITE path on PostgreSQL (design 4.C "Write and break-glass path").
+#   - OpenBao role app1-pg-rw creates short-lived (30 min) temp users ON THE PRIMARY, members of
+#     debug_rw (config/postgres/phase6-write-access.sh): SELECT/INSERT/UPDATE/DELETE on an
+#     allow-list of base tables, nothing else. Policy app1-write, identity group app1-devs-rw,
+#     Keycloak group app1-devs-rw, which only the portal fills, after approval by a member of
+#     app1-write-approvers who is not the requester.
+#   - pg-primary joins the internal network rw-access (10.81.15.0/24), the ONLY place a write
+#     user may connect from (pg_hba_primary below). The replica's pg_hba refuses them (they are
+#     not in debug_ro), and the read path (network access) still never reaches the primary.
+#   - Every write session is audited three ways: pgAudit on the temp role itself (read, write,
+#     ddl, role, function, misc, with parameters and row counts), the row trigger
+#     dev_audit.capture() (old and new row in dev_audit.row_changes and a DEV_CHANGE line in the
+#     server log), and the login itself. All of it reaches log-store; audit.lua raises
+#     write_access_login and write_access_statement.
+#   - pg-primary is recreated by this file (one more network and config); its data volume stays.
+#
 # Fixed addresses:
 #   portal-edge 10.81.13.0/24
 #   portal-idp  10.81.14.0/24  keycloak .10, portal .20
+#   rw-access   10.81.15.0/24  pg-primary .10 (developer write sessions only)
 
 services:
 
@@ -90,7 +108,8 @@ services:
       Portal__ReconcileSeconds: "15"
       Portal__DriftAction: remove
       # LAB-ONLY: alice is a permanent app1-devs member in the realm seed (phases 2 to 5).
-      Portal__StandingMembers__0: alice
+      # Per app (index 0 = app1 in appsettings.json): she has no standing write access.
+      Portal__Apps__0__StandingMembers__0: alice
       # LAB-ONLY: Bearer tokens of the test client "portal-test" (tests\phase6-checks.ps1).
       Portal__AcceptBearer: "true"
     secrets:
@@ -120,6 +139,15 @@ services:
   # user IDs, which breaks Grafana's stored sign-in links (measured). phase6-setup.ps1 attaches
   # the running Keycloak container to portal-idp instead ("docker network connect", idempotent).
 
+  # Phase 6b: write sessions reach the primary on rw-access only. Its pg_hba is replaced below.
+  pg-primary:
+    configs:
+      - source: pg_phase6_write_access
+        target: /opt/phase6/write-access.sh
+    networks:
+      rw-access:
+        ipv4_address: 10.81.15.10
+
   # The shipper also reads the portal's audit log (read-only) with the phase 6 configuration.
   fluent-bit:
     volumes:
@@ -129,6 +157,12 @@ services:
         condition: service_completed_successfully
 
 networks:
+  # Phase 6b: developer write sessions -> pg-primary. Nothing else is on it.
+  rw-access:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.81.15.0/24
   # Only for the published port (an internal network cannot publish one).
   portal-edge:
     ipam:
@@ -147,6 +181,26 @@ volumes:
 configs:
   fluent_bit_conf:
     file: ./config/fluent-bit/phase6/fluent-bit.conf
+  pg_phase6_write_access:
+    file: ./config/postgres/phase6-write-access.sh
+  # Phase 6b: replaces the phase 5 primary file. First match wins.
+  # - bao_admin holds ADMIN OPTION on debug_ro and debug_rw and matches both "+" lines, so its
+  #   own line comes first.
+  # - Read temp users (+debug_ro) are still refused everywhere on the primary.
+  # - Write temp users (+debug_rw) only from rw-access, only database app1, only over TLS.
+  pg_hba_primary:
+    content: |
+      # TYPE  DATABASE     USER           ADDRESS         METHOD
+      local   all          postgres                       peer
+      hostssl app1         bao_admin      10.81.4.10/32   scram-sha-256
+      host    all          +debug_ro      all             reject
+      hostssl app1         +debug_rw      10.81.15.0/24   scram-sha-256
+      host    all          +debug_rw      all             reject
+      hostssl app1         app1_runtime   10.81.2.0/24    scram-sha-256
+      hostssl app1         app1_migrator  10.81.2.0/24    scram-sha-256
+      hostssl replication  replicator     10.81.7.11/32   scram-sha-256
+      host    replication  all            all             reject
+      host    all          all            all             reject
 
 secrets:
   keycloak_portal_client_secret:

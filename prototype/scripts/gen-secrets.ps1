@@ -129,11 +129,13 @@ foreach ($n in @(
 # - keycloak_portal_group_manager_secret: client secret of the service-account client
 #   "portal-group-manager" (the portal adds and removes app1-devs memberships with it).
 # - keycloak_carol_password: LAB-ONLY test approver "carol" (created by phase6-setup.ps1).
-# phase6-setup.ps1 writes all three values into Keycloak.
+# - keycloak_dave_password: LAB-ONLY write approver "dave" (app1-write-approvers, phase 6b).
+# phase6-setup.ps1 writes all of these values into Keycloak.
 foreach ($n in @(
         'keycloak_portal_client_secret',
         'keycloak_portal_group_manager_secret',
-        'keycloak_carol_password')) {
+        'keycloak_carol_password',
+        'keycloak_dave_password')) {
     Write-Secret $n { New-RandomPassword 32 }
 }
 

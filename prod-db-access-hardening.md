@@ -3,7 +3,7 @@
 Date: 2026-11-17
 Revision 8
 
-**Status:** Phases 0 to 4 were executed in the prototype: sections 4.A, 4.B, 4.C (replica path), 4.E (database audit and shipping) and 5. Test counts against the phase 4 stack: 13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently). The MariaDB binary-log password leak found in phase 4 is fixed and tested (4.E, 5.3). Phase 5 (debug telemetry: traces and logs in Grafana, redacted, separate from the audit store) was executed on 2026-11-23: 27 phase 5 checks and 13 smoke checks pass; the phase 4 suite on the phase 5 stack passes 94 of 96 (two app-request checks hit dropped host connections, 7.5). The approval portal (phase 6, 4.C "Approval design") was built and tested on 2026-11-23 as an add-on to the phase 5 stack: 83 phase 6 checks pass. Warpgate and the break-glass role and alert (rest of phase 6) have **not** been executed. Host access controls (4.D) have **not** been executed. Items still marked "to test" remain unverified.
+**Status:** Phases 0 to 4 were executed in the prototype: sections 4.A, 4.B, 4.C (replica path), 4.E (database audit and shipping) and 5. Test counts against the phase 4 stack: 13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently). The MariaDB binary-log password leak found in phase 4 is fixed and tested (4.E, 5.3). Phase 5 (debug telemetry: traces and logs in Grafana, redacted, separate from the audit store) was executed on 2026-11-23: 27 phase 5 checks and 13 smoke checks pass; the phase 4 suite on the phase 5 stack passes 94 of 96 (two app-request checks hit dropped host connections, 7.5). The approval portal (phase 6, 4.C "Approval design") was built and tested on 2026-11-23 as an add-on to the phase 5 stack: 83 phase 6 checks pass. The PostgreSQL developer write path with per-session and per-row audit (phase 6b, 4.C "Write and break-glass path") was built and tested on 2026-11-24: 58 checks pass. Warpgate, the emergency superuser password and its alert (rest of phase 6), and a MariaDB write path have **not** been executed. Host access controls (4.D) have **not** been executed. Items still marked "to test" remain unverified.
 
 **Main open problem:** none on revocation. On PostgreSQL a role revoked while the primary is down is refused by the replica within one reconciler interval plus 2 s (replica-side deny list, 5.4).
 
@@ -300,9 +300,23 @@ Measured in the lab (2026-11-23, `tests/phase6-checks.ps1`, 83 checks):
 
 #### Write and break-glass path
 
-- A separate OpenBao role `app1-pg-rw` (TTL 30 min, on the primary) behind a different group that needs second-person approval.
+- A separate OpenBao role `app1-pg-rw` (TTL 30 min, on the primary) behind a different group that needs second-person approval. **Built and tested for PostgreSQL in phase 6b (2026-11-24)**; details below.
 - The preferred route for data fixes remains a reviewed migration (principle 8).
-- An emergency superuser password is stored in OpenBao KV under a path readable only by a break-glass policy. Every read raises an alert.
+- An emergency superuser password is stored in OpenBao KV under a path readable only by a break-glass policy. Every read raises an alert. Not built.
+
+**PostgreSQL write path as built (phase 6b).**
+- **Request.** Portal app `app1-write`, at most 60 min. Approvers come from their own Keycloak group `app1-write-approvers`, never the requester. Members of `app1-approvers` can neither approve nor see write requests.
+- **Membership and credentials.** On approval the portal adds the developer to `app1-devs-rw`. OpenBao maps that group to the policy `app1-write`, which allows only `database/creds/app1-pg-rw`.
+- **Temp user.** Created on the primary: 30-minute lease (renewal cannot extend it), `CONNECTION LIMIT 1`, `statement_timeout` 60 s, `lock_timeout` 5 s, `idle_in_transaction_session_timeout` 2 min.
+- **Privileges.** Member of `debug_rw`: SELECT, INSERT, UPDATE and DELETE on an explicit allow-list (`public.customers`, `public.orders`). No TRUNCATE, no DDL, no masked views. UPDATE and DELETE with a WHERE clause need SELECT, so the write path sees unmasked data. That is one reason it is a rarer request.
+- **Network.** The developer connects from a separate internal network, `rw-access`. The primary's `pg_hba` allows `+debug_rw` only from there, only to `app1`, only with `hostssl`. Its `+debug_ro` reject line stays. The replica refuses write users because they are not in `debug_ro`.
+- **Audit, three layers, all shipped to the store:**
+  1. **pgAudit on the temp role itself.** The creation statements call `dev_audit.enable_session_audit(name)`, which sets `pgaudit.log = 'read, write, ddl, role, function, misc'`, `log_relation`, `log_parameter` and `log_rows` on that role. The function is SECURITY DEFINER, owned by `postgres`, executable only by `bao_admin`. It refuses anything but an existing `v-` login role in `debug_rw`. If it fails, no credentials are issued. `bao_admin` gets no SET privilege on `pgaudit.*`.
+  2. **Row trigger `zz_dev_audit`.** For `v-` sessions only, it writes old and new rows to `dev_audit.row_changes` in the same transaction, plus a `DEV_CHANGE: {json}` server-log line. Only `audit_owner` (NOLOGIN) can read or write `dev_audit`.
+  3. **Alerts** `write_access_login` and `write_access_statement` (4.E).
+- **What the write user cannot do (tested):** set `pgaudit.*`, `log_min_messages` or `session_replication_role`, `ALTER ROLE ... SET`, disable the trigger, read or delete `dev_audit`, or `SET ROLE` to the application account.
+- **MariaDB has no write path.** Its temp users exist only on the replica (4.E, binary-log password leak), so it needs a separate design. One option is pre-created, locked accounts on the primary that are unlocked per grant.
+- **The removal delay above matters more here.** After a grant ends, a token issued before can mint fresh write credentials until it expires (4 h max) or the developer logs in again.
 
 ### 4.D Host and container access
 
@@ -491,6 +505,8 @@ Not shipped: auditd and Docker events (see 4.D).
 | `pg_deny_descriptor_rejected` | A file in the descriptor volume failed validation (bug or compromised reconciler). |
 | `pg_deny_watcher_failed` | The watcher was restarted, its supervisor stopped, the descriptor directory is unreadable, or a rewrite or reload failed. |
 | `pg_server_process_crashed` | The postmaster saw a child die abnormally and restarted every session. |
+| `write_access_login` | Phase 6b: a write temp user (`app1-pg-rw`) logged in to the primary. Every one is reviewed against its ticket. |
+| `write_access_statement` | Phase 6b: a write temp user ran a pgAudit WRITE statement. Replaces `temp_user_write` for these users. The changed rows themselves arrive as `event: row_change` records (no alert). |
 
 The PostgreSQL superuser-login exception also covers the deny-list watcher (local socket and `application_name=pg-deny-watcher`, which a local superuser could fake).
 
@@ -787,7 +803,7 @@ Notes:
 - Timeouts set with `ALTER ROLE ... SET` are defaults. The user can override them with `SET`. They are a guard rail, not a control.
 - Do not use `DO` blocks in statements: the plugin splits statements on semicolons.
 - The termination in the PostgreSQL revocation statement runs on the primary only. Temp users cannot log in there, so it matters only as defence in depth. See 5.4 for the replica.
-- The `app1-pg-rw` break-glass role follows the same pattern with `default_ttl=30m max_ttl=30m`, a separate write role in place of `debug_ro`, and its own `pg_hba.conf` line on the primary. Its details are for phase 6.
+- The `app1-pg-rw` write role follows the same pattern with `default_ttl=30m max_ttl=30m`, `debug_rw` in place of `debug_ro`, `CONNECTION LIMIT 1`, `lock_timeout` and `idle_in_transaction_session_timeout`, a final `SELECT dev_audit.enable_session_audit('{{name}}')`, and its own `pg_hba.conf` line on the primary. As built in phase 6b: 4.C "Write and break-glass path" and `prototype/scripts/phase6-setup.ps1`.
 
 ### 5.4 Sessions outlive revocation
 
@@ -1054,7 +1070,7 @@ Goal: prove all five workstreams end to end on disposable infrastructure: a Wind
 | 3 Replicas | PostgreSQL streaming replica (`pg_basebackup` bootstrap), MariaDB replica (`server_id`, binlog, GTID), `pg_hba.conf` split, sweepers. | Replica tests in 7.4 pass. | Done 2026-11-17. Streaming replica and GTID replica over verified TLS, `pg_hba.conf` split, primaries off the access network, sweepers, stale-user report (13 smoke, 38 hardening, 83 access, 93 replica checks). |
 | 4 Workstream E | pgAudit (custom image) and `server_audit` on all servers, Fluent Bit to a volume only the log container mounts. | Audit tests in 7.4 pass. | Done 2026-11-17. pgAudit and `server_audit` on all four servers, Fluent Bit to an isolated store, lab alert rules, MariaDB binary-log password leak fixed by replica-only temp users and hash-only password statements. Revocation backstops: MariaDB startup purge and replica-local expiry event, a lease reconciler for both engines, and a PostgreSQL replica-side deny list (watcher inside pg-replica), with eight new alerts (13 smoke, 38 hardening, 84 access, 95 replica, 96 audit, 129 revocation checks (133 with the opt-in irrevocable-lease test), all passing on a from-scratch stack (re-run independently)). |
 | 5 Debug telemetry (principle 1) | Traces and logs from the browser (Grafana Faro) and both APIs (OpenTelemetry) through Grafana Alloy to Loki and Tempo, read in Grafana with Keycloak sign-in. Redaction before storage. Configuration adapted from the existing `telemetries` repository. Separate from the audit pipeline. | One request gives one trace browser -> API -> SQL with correlated logs; sentinel personal data appears in no trace or log line; no telemetry container touches an audit volume; Grafana admits `app1-devs` only. | Done 2026-11-23 (27 phase 5 checks, 13 smoke; phase 4 suite on the phase 5 stack 94 of 96, see 7.5). Browser path also checked by hand in a real browser. |
-| 6 Optional | Approval portal, Warpgate, break-glass role and alert. | Portal: requests with ticket and approver; no self-approval; the membership exists only while a grant is active; every step reaches the audit store; the service account cannot change anything else. | Portal done 2026-11-23 as an add-on to the phase 5 stack (`compose.phase6.yaml`, 83 phase 6 checks; see 4.C). Warpgate and break-glass not started. |
+| 6 Optional | Approval portal, Warpgate, break-glass role and alert. | Portal: requests with ticket and approver; no self-approval; the membership exists only while a grant is active; every step reaches the audit store; the service account cannot change anything else. | Portal done 2026-11-23 as an add-on to the phase 5 stack (`compose.phase6.yaml`, 83 phase 6 checks; see 4.C). PostgreSQL write path with audit done 2026-11-24 (`tests/phase6-write-checks.ps1`, 58 checks; see 4.C "Write and break-glass path"). Warpgate, the emergency superuser password and a MariaDB write path not started. |
 
 ### 7.3 Windows notes
 
@@ -1095,10 +1111,16 @@ All items below were proven in phases 0 to 5. None is unmet.
 - [x] Phase 5: customer data sent through both APIs appears in no trace and no log line; SQL is recorded with placeholders only; e-mail addresses in browser logs are masked.
 - [x] Phase 5: no telemetry container mounts an audit volume or the store; the apps reach Alloy but not Loki, Tempo or Grafana; only Grafana is published, on loopback; Loki holds no audit records.
 - [x] Phase 5: Grafana admits only Keycloak users in `app1-devs` (Viewer with Explore, no write permissions); others, anonymous access and the local admin over HTTP are refused.
+- [x] Phase 6b: write credentials need approval by `app1-write-approvers` (not the requester, not `app1-approvers`); only `app1-devs-rw` members read them; leases last at most 30 min.
+- [x] Phase 6b: write users log in only to the primary, only from `rw-access`, only to `app1`. The replica refuses them. Read users are still refused on the primary.
+- [x] Phase 6b: write users can INSERT, UPDATE and DELETE on the allow-list only, and cannot turn off or read any audit layer (pgAudit settings, trigger, `session_replication_role`, log level, `dev_audit`).
+- [x] Phase 6b: every write is in the store three ways: pgAudit statement with row count, `row_change` with old and new row, alerts `write_access_login` and `write_access_statement`. Rolled-back changes leave no `row_changes` row. Application writes are not captured.
+- [x] Phase 6b: revoking a write lease ends the open session and drops the role on primary and replica.
 
 ### 7.5 Known weaknesses found in the prototype
 
 - **Phase 5, host-to-container requests (open).** On the phase 5 stack, `phase4-checks.ps1` fails 2 of 96 checks in two runs: some of its Windows PowerShell requests to `http://localhost:8080` (4 Laravel POSTs during the churn, and a few of 20 GETs) time out. nginx logged every request it received as 200 or 201 and logged no 499 or 504, so the lost requests never reached the container: they were dropped in Docker Desktop's port forwarding. In a separate probe, `Invoke-WebRequest` lost 3 of 40 requests to `127.0.0.1:8080` and none of 40 to `localhost`; curl lost none of 120. Not yet determined: whether the phase 4 stack shows the same on this host now, and whether the extra load of phase 5 contributes. The two checks' database and replication assertions pass.
+- **Phase 6b write path.** The audit store now holds changed rows, including unmasked customer data, so its access and retention must allow that. The `DEV_CHANGE` log line is written even for rolled-back changes (join on `txid` with `dev_audit.row_changes`). The trigger is lost when a migration recreates a table; `phase6-setup.ps1` must run again, and nothing alerts on a missing trigger yet. A superuser can still disable the trigger or pgAudit. Write users see unmasked data of the allow-listed tables.
 - **Phase 5 memory.** Grafana 13 needs about 430 MiB right after start; with a 192 MiB limit its first start stalled at full CPU, so the limit is 512 MiB with `GOMEMLIMIT=350MiB`. The telemetry services together use about 810 MiB; the whole phase 5 stack about 1.9 GiB.
 - **Phase 5 lab shortcuts.** OTLP and the store APIs have no TLS and no authentication (isolation by internal networks only); every trace is sampled; Grafana's `viewers_can_edit` is deprecated in Grafana 13 (it still gives Viewers Explore; a custom role will be needed when it is removed).
 
