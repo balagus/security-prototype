@@ -1,0 +1,103 @@
+-- init_file of maria-replica (compose.yaml). Rendered at EVERY container start by
+-- config/mariadb/replica-backstop-init.sh (it fills in the numbers from the BACKSTOP_*
+-- environment variables) to /etc/mysql/replica-init/init.sql, which the server runs with
+-- --init-file at every start.
+--
+-- MariaDB runs the init_file in a bootstrap thread with all privileges BEFORE it opens the
+-- network listener, so nothing below races with a client login. Measured (11.8): compound
+-- statements work here (DELIMITER form and one-line form), read_only does not block them, and
+-- SET SESSION sql_log_bin = 0 works. Without it the purge got a local GTID 0-2-n in the
+-- replica's binlog (measured), which would break replication under gtid_strict_mode.
+-- server_audit records these statements with user "boot" (no host).
+--
+-- 1. Startup purge (closes the post-restart login window, docs/DECISIONS.md D8): every MariaDB temp user is temporary and exists only on this
+--    replica (OpenBao creates it here with sql_log_bin = 0), so ALL local "v-" accounts are
+--    dropped before the first network connection can be accepted. A developer whose lease is
+--    still valid requests new credentials; OpenBao's later revocation of that lease still
+--    succeeds (DROP USER IF EXISTS). One line per start (also with dropped=0) goes to the
+--    backstop log directory, which Fluent Bit ships; a non-zero count raises an alert.
+-- 2. The replica-local expiry backstop: the account revocation_backstop (local, locked, no
+--    password: it can never log in; it is only the DEFINER of the event) and the event
+--    replica_local.revocation_backstop, created here at every start so that they come back
+--    after a re-seed (the seed loads the primary's mysql database).
+SET SESSION sql_log_bin = 0;
+
+DELIMITER $$
+BEGIN NOT ATOMIC
+  DECLARE n INT DEFAULT 0;
+  DECLARE dropped_list TEXT DEFAULT NULL;
+  FOR rec IN (SELECT User, Host FROM mysql.global_priv WHERE User LIKE 'v-%' ORDER BY User, Host) DO
+    EXECUTE IMMEDIATE CONCAT('DROP USER IF EXISTS ', QUOTE(rec.User), '@', QUOTE(rec.Host));
+    SET n = n + 1;
+    SET dropped_list = CONCAT_WS(',', dropped_list, rec.User);
+  END FOR;
+  EXECUTE IMMEDIATE CONCAT('SELECT ',
+    QUOTE(CONCAT(DATE_FORMAT(UTC_TIMESTAMP(6), '%Y-%m-%dT%H:%i:%s.%fZ'),
+                 ' engine=mariadb action=startup-purge dropped=', n, ' users=', IFNULL(dropped_list, '-'),
+                 ' sql_log_bin=', @@session.sql_log_bin, ' read_only=', @@global.read_only)),
+    ' INTO OUTFILE ', QUOTE(CONCAT('@@BACKSTOP_DIR@@/startup-purge-', REPLACE(UNIX_TIMESTAMP(NOW(6)), '.', ''), '.log')));
+END$$
+DELIMITER ;
+
+-- Local schema for the event. Not in the primary's dump, so a re-seed keeps it.
+CREATE DATABASE IF NOT EXISTS replica_local COMMENT 'maria-replica only, never replicated (sql_log_bin = 0)';
+
+-- The event's definer. Each privilege was measured by removing it (tests\revocation-checks.ps1):
+--   CREATE USER                  ALTER USER ... ACCOUNT LOCK and DROP USER
+--   READ ONLY ADMIN              the replica is read_only: without it ALTER/DROP USER are refused
+--   BINLOG ADMIN                 SET SESSION sql_log_bin = 0 in the event body
+--   CONNECTION ADMIN             KILL USER (without it KILL USER silently kills nothing)
+--   FILE                         SELECT ... INTO OUTFILE of the log line; --secure-file-priv
+--                                limits FILE to the backstop log directory
+--   SELECT (User, Host) ON mysql.global_priv   to find the v- accounts
+--   EVENT ON replica_local.*     schema access for the event itself ("Access denied for user
+--                                ... to database 'replica_local'" without it)
+-- ACCOUNT LOCK and no password: nobody can log in as this account; the event scheduler runs the
+-- event as its definer regardless.
+CREATE USER IF NOT EXISTS 'revocation_backstop'@'localhost' ACCOUNT LOCK;
+ALTER USER 'revocation_backstop'@'localhost' ACCOUNT LOCK;
+REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'revocation_backstop'@'localhost';
+GRANT CREATE USER, READ ONLY ADMIN, BINLOG ADMIN, CONNECTION ADMIN, FILE ON *.* TO 'revocation_backstop'@'localhost';
+GRANT SELECT (User, Host) ON mysql.global_priv TO 'revocation_backstop'@'localhost';
+GRANT EVENT ON replica_local.* TO 'revocation_backstop'@'localhost';
+
+-- Replica-side expiry backstop (docs/DECISIONS.md D8): every BACKSTOP_INTERVAL_SECONDS, drop the v- users
+-- whose embedded creation time is older than max_ttl + margin. OpenBao revokes every lease at
+-- max_ttl at the latest, so such a user exists only because a revocation failed (replica down
+-- longer than OpenBao's retries, irrevocable lease, lost lease); each drop raises an alert.
+-- The creation time is the 10-digit unix timestamp right before the random suffix, matched
+-- anchored at the END of the name (display names may contain hyphens and digits):
+--   v-<display name>-<role>-<unix time>-<random>
+-- Names without that pattern are left alone (the startup purge drops them at the next start).
+-- For each user: lock (no new login), KILL USER (open sessions), DROP USER. sql_log_bin = 0:
+-- nothing reaches the replica's binlog. The event lives on this replica only and never
+-- replicates; events that arrive from the primary are created SLAVESIDE_DISABLED by MariaDB.
+DELIMITER $$
+CREATE OR REPLACE DEFINER = 'revocation_backstop'@'localhost' EVENT replica_local.revocation_backstop
+  ON SCHEDULE EVERY @@BACKSTOP_INTERVAL_SECONDS@@ SECOND
+  ON COMPLETION PRESERVE ENABLE
+  COMMENT 'Drops v- users older than max_ttl @@BACKSTOP_MAX_TTL_SECONDS@@ s + margin @@BACKSTOP_MARGIN_SECONDS@@ s. Local to maria-replica.'
+  DO BEGIN NOT ATOMIC
+    DECLARE n INT DEFAULT 0;
+    DECLARE dropped_list TEXT DEFAULT NULL;
+    SET SESSION sql_log_bin = 0;
+    FOR rec IN (SELECT User, Host FROM mysql.global_priv
+                WHERE User LIKE 'v-%'
+                  AND CAST(NULLIF(REGEXP_SUBSTR(User, '(?<=-)[0-9]{10}(?=-[^-]+$)'), '') AS UNSIGNED)
+                      <= UNIX_TIMESTAMP() - (@@BACKSTOP_MAX_TTL_SECONDS@@ + @@BACKSTOP_MARGIN_SECONDS@@)
+                ORDER BY User, Host) DO
+      EXECUTE IMMEDIATE CONCAT('ALTER USER ', QUOTE(rec.User), '@', QUOTE(rec.Host), ' ACCOUNT LOCK');
+      EXECUTE IMMEDIATE CONCAT('KILL USER ', QUOTE(rec.User));
+      EXECUTE IMMEDIATE CONCAT('DROP USER IF EXISTS ', QUOTE(rec.User), '@', QUOTE(rec.Host));
+      SET n = n + 1;
+      SET dropped_list = CONCAT_WS(',', dropped_list, rec.User);
+    END FOR;
+    IF n > 0 THEN
+      EXECUTE IMMEDIATE CONCAT('SELECT ',
+        QUOTE(CONCAT(DATE_FORMAT(UTC_TIMESTAMP(6), '%Y-%m-%dT%H:%i:%s.%fZ'),
+                     ' engine=mariadb action=expiry-drop dropped=', n, ' users=', dropped_list,
+                     ' max_ttl=@@BACKSTOP_MAX_TTL_SECONDS@@ margin=@@BACKSTOP_MARGIN_SECONDS@@ sql_log_bin=', @@session.sql_log_bin)),
+        ' INTO OUTFILE ', QUOTE(CONCAT('@@BACKSTOP_DIR@@/expiry-drop-', REPLACE(UNIX_TIMESTAMP(NOW(6)), '.', ''), '.log')));
+    END IF;
+  END$$
+DELIMITER ;
